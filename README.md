@@ -1,9 +1,10 @@
 # pCloud Fast Transfer
 
-A high-performance command-line tool for uploading and downloading files to/from pCloud with parallel transfer support.
+A high-performance tool for uploading and downloading files to/from pCloud with parallel transfer support. Available with both a **modern GUI** and **command-line interface**.
 
 ## Features
 
+- **🎨 Modern GUI**: Sleek, intuitive interface with dark/light themes
 - **⚡ Parallel Transfers**: Upload/download multiple files simultaneously using configurable workers
 - **📦 Chunked Uploads**: Large files are split into chunks for better reliability
 - **📊 Progress Tracking**: Real-time transfer speed and progress monitoring
@@ -11,6 +12,7 @@ A high-performance command-line tool for uploading and downloading files to/from
 - **🔄 Resume Support**: Failed transfers can be retried without starting over
 - **🌍 Multi-Region**: Support for both US and EU pCloud regions
 - **📁 Batch Operations**: Upload/download entire directories recursively
+- **🖱️ Drag & Drop**: Easy file selection with modern UI (GUI mode)
 
 ## Installation
 
@@ -31,6 +33,30 @@ chmod +x cli.py
 ```
 
 ## Quick Start
+
+### GUI Mode (Recommended for Desktop Users)
+
+Launch the modern graphical interface:
+
+```bash
+python gui.py
+```
+
+Or use the launcher:
+
+```bash
+python launch_gui.py
+```
+
+**GUI Features:**
+- 🔐 **Login Dialog**: Secure authentication with username/password
+- 📤 **Upload Tab**: Select files or folders with visual progress tracking
+- 📥 **Download Tab**: Browse and select files from pCloud
+- 📁 **Browse Tab**: Navigate your pCloud storage
+- ⚙️ **Settings**: Configure workers, appearance (dark/light mode)
+- 📊 **Real-time Progress**: Live speed and ETA display during transfers
+
+### CLI Mode (For Automation & Scripting)
 
 ### Authentication
 
@@ -274,6 +300,34 @@ If you encounter rate limiting:
 - **Token Storage**: Auth tokens are stored in `~/.pcloud_fast_transfer/auth_token.json`
 - **Password Handling**: Passwords are never stored; only auth tokens are cached
 - **Secure Connections**: All API calls use HTTPS
+
+## GUI Details
+
+The graphical interface is built with **CustomTkinter**, providing a modern, responsive user experience.
+
+### GUI Components
+
+1. **gui.py** - Main GUI application
+2. **launch_gui.py** - Simple launcher script
+
+### GUI Architecture
+
+- **PCloudGUI**: Main application window with tabbed interface
+- **AuthDialog**: Modal dialog for secure authentication
+- **ProgressDialog**: Real-time transfer progress with metrics
+- **Threading**: Background operations keep UI responsive
+- **Auto-login**: Cached tokens enable seamless startup
+
+### Appearance Customization
+
+The GUI supports three appearance modes:
+- **Dark** (default): Modern dark theme
+- **Light**: Bright, clean interface
+- **System**: Matches OS preference
+
+Change appearance in Settings (⚙️) after logging in.
+
+For GUI screenshots and visual guide, see [SCREENSHOTS.md](SCREENSHOTS.md).
 
 ## API Reference
 
