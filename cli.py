@@ -38,7 +38,8 @@ def upload_command(args):
         auth_token=auth_token,
         region=args.region,
         workers=args.workers,
-        chunk_size=args.chunk_size * 1024 * 1024  # Convert MB to bytes
+        chunk_size=args.chunk_size * 1024 * 1024,  # Convert MB to bytes
+        duplicate_mode=args.duplicate_mode
     )
 
     # Collect files to upload
@@ -68,7 +69,7 @@ def upload_command(args):
             print(f"✓ Created folder: {args.remote_path} (ID: {folder_id})")
 
     # Upload files
-    successful, failed = client.upload_files(files_to_upload, args.remote_path)
+    uploaded, skipped, failed = client.upload_files(files_to_upload, args.remote_path)
 
     if failed > 0:
         sys.exit(1)
@@ -95,7 +96,8 @@ def download_command(args):
         password=password,
         auth_token=auth_token,
         region=args.region,
-        workers=args.workers
+        workers=args.workers,
+        duplicate_mode=args.duplicate_mode
     )
 
     # List remote files if directory provided
@@ -124,7 +126,7 @@ def download_command(args):
     Path(args.local_path).mkdir(parents=True, exist_ok=True)
 
     # Download files
-    successful, failed = client.download_files(remote_files)
+    downloaded, skipped, failed = client.download_files(remote_files)
 
     if failed > 0:
         sys.exit(1)
@@ -239,6 +241,9 @@ Environment Variables:
                               help='Create remote folder if it doesn\'t exist')
     upload_parser.add_argument('--chunk-size', type=int, default=10,
                               help='Chunk size in MB for large files (default: 10)')
+    upload_parser.add_argument('--duplicate-mode', choices=['skip', 'overwrite', 'rename'],
+                              default='rename',
+                              help='How to handle duplicates: skip (skip if exists), overwrite (replace existing), rename (auto-rename) (default: rename)')
     upload_parser.set_defaults(func=upload_command)
 
     # Download command
@@ -250,6 +255,9 @@ Environment Variables:
                                 help='Local destination path (default: ./downloads)')
     download_parser.add_argument('--all', '-a', action='store_true',
                                 help='Download all files from remote folder')
+    download_parser.add_argument('--duplicate-mode', choices=['skip', 'overwrite', 'rename'],
+                                default='rename',
+                                help='How to handle duplicates: skip (skip if exists), overwrite (replace existing), rename (let OS rename) (default: rename)')
     download_parser.set_defaults(func=download_command)
 
     # List command

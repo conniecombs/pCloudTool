@@ -86,7 +86,8 @@ class PCloudClient:
 
     def __init__(self, username: Optional[str] = None, password: Optional[str] = None,
                  auth_token: Optional[str] = None, region: str = 'us',
-                 workers: int = DEFAULT_WORKERS, chunk_size: int = CHUNK_SIZE):
+                 workers: int = DEFAULT_WORKERS, chunk_size: int = CHUNK_SIZE,
+                 duplicate_mode: str = 'rename'):
         """
         Initialize pCloud client
 
@@ -97,6 +98,7 @@ class PCloudClient:
             region: API region ('us' or 'eu')
             workers: Number of parallel workers for transfers
             chunk_size: Size of chunks for large file uploads
+            duplicate_mode: How to handle duplicates ('skip', 'overwrite', 'rename')
         """
         self.region = region
         self.api_url = self.API_ENDPOINTS[region]
@@ -106,6 +108,7 @@ class PCloudClient:
         self.username = username
         self.password = password
         self.stats_lock = Lock()
+        self.duplicate_mode = duplicate_mode
 
         # Cache directory for auth tokens
         self.cache_dir = Path.home() / '.pcloud_fast_transfer'
@@ -240,8 +243,91 @@ class PCloudClient:
             print(f"✗ Failed to list folder '{path}': {error}")
             return []
 
+    def check_file_exists(self, remote_folder: str, filename: str) -> Optional[Dict]:
+        """
+        Check if a file exists in a remote folder
+
+        Args:
+            remote_folder: Remote folder path
+            filename: Name of the file to check
+
+        Returns:
+            File metadata dict if exists, None otherwise
+        """
+        contents = self.list_folder(remote_folder)
+        for item in contents:
+            if not item.get('isfolder') and item.get('name') == filename:
+                return item
+        return None
+
+    def should_skip_upload(self, local_file: Path, remote_folder: str) -> Tuple[bool, Optional[str]]:
+        """
+        Determine if an upload should be skipped based on duplicate mode
+
+        Args:
+            local_file: Local file path
+            remote_folder: Remote folder path
+
+        Returns:
+            Tuple of (should_skip, reason)
+        """
+        if self.duplicate_mode == 'rename':
+            return False, None  # Never skip, let pCloud rename
+
+        existing_file = self.check_file_exists(remote_folder, local_file.name)
+
+        if existing_file is None:
+            return False, None  # File doesn't exist, don't skip
+
+        # File exists, check mode
+        if self.duplicate_mode == 'skip':
+            local_size = local_file.stat().st_size
+            remote_size = existing_file.get('size', 0)
+
+            if local_size == remote_size:
+                return True, f"identical size ({local_size} bytes)"
+            else:
+                return True, f"exists but different size (local: {local_size}, remote: {remote_size})"
+
+        elif self.duplicate_mode == 'overwrite':
+            return False, "will overwrite"
+
+        return False, None
+
+    def should_skip_download(self, local_path: str, remote_size: int) -> Tuple[bool, Optional[str]]:
+        """
+        Determine if a download should be skipped based on duplicate mode
+
+        Args:
+            local_path: Local file path
+            remote_size: Size of remote file in bytes
+
+        Returns:
+            Tuple of (should_skip, reason)
+        """
+        local_file = Path(local_path)
+
+        if not local_file.exists():
+            return False, None  # File doesn't exist locally, don't skip
+
+        if self.duplicate_mode == 'skip':
+            local_size = local_file.stat().st_size
+
+            if local_size == remote_size:
+                return True, f"identical size ({local_size} bytes)"
+            else:
+                return True, f"exists but different size (local: {local_size}, remote: {remote_size})"
+
+        elif self.duplicate_mode == 'overwrite':
+            return False, "will overwrite"
+
+        elif self.duplicate_mode == 'rename':
+            return False, None  # Let OS handle renaming
+
+        return False, None
+
     def upload_file(self, local_path: str, remote_path: str = '/',
-                   progress_callback: Optional[Callable] = None) -> bool:
+                   progress_callback: Optional[Callable] = None) -> Tuple[bool, str]:
         """
         Upload a single file to pCloud
 
@@ -251,32 +337,46 @@ class PCloudClient:
             progress_callback: Optional callback for progress updates
 
         Returns:
-            True if upload successful
+            Tuple of (success, status_message)
+            status can be: 'uploaded', 'skipped', 'failed'
         """
         local_file = Path(local_path)
 
         if not local_file.exists():
             print(f"✗ File not found: {local_path}")
-            return False
+            return False, 'failed'
+
+        # Check for duplicates
+        should_skip, skip_reason = self.should_skip_upload(local_file, remote_path)
+        if should_skip:
+            print(f"⊘ Skipped {local_file.name}: {skip_reason}")
+            return True, 'skipped'
 
         file_size = local_file.stat().st_size
 
         # For small files, use simple upload
         if file_size < self.chunk_size:
-            return self._simple_upload(local_file, remote_path, progress_callback)
+            success = self._simple_upload(local_file, remote_path, progress_callback)
         else:
             # For large files, use chunked upload
-            return self._chunked_upload(local_file, remote_path, progress_callback)
+            success = self._chunked_upload(local_file, remote_path, progress_callback)
+
+        return success, ('uploaded' if success else 'failed')
 
     def _simple_upload(self, local_file: Path, remote_path: str,
                        progress_callback: Optional[Callable] = None) -> bool:
         """Upload a file using simple uploadfile method"""
         try:
+            # Determine upload parameters based on duplicate mode
+            params = {'path': remote_path}
+            if self.duplicate_mode == 'rename':
+                params['renameifexists'] = 1
+            elif self.duplicate_mode == 'overwrite':
+                params['nopartial'] = 1  # Overwrite existing file
+
             with open(local_file, 'rb') as f:
                 files = {'file': (local_file.name, f)}
-                response = self._api_call('uploadfile',
-                                         {'path': remote_path, 'renameifexists': 1},
-                                         files=files)
+                response = self._api_call('uploadfile', params, files=files)
 
             if response.get('result') == 0:
                 if progress_callback:
@@ -312,11 +412,16 @@ class PCloudClient:
             # For production use, consider using pCloud's official SDK
 
             # For now, upload as single file with progress tracking
+            # Determine upload parameters based on duplicate mode
+            params = {'path': remote_path}
+            if self.duplicate_mode == 'rename':
+                params['renameifexists'] = 1
+            elif self.duplicate_mode == 'overwrite':
+                params['nopartial'] = 1  # Overwrite existing file
+
             with open(local_file, 'rb') as f:
                 files = {'file': (local_file.name, f)}
-                response = self._api_call('uploadfile',
-                                         {'path': remote_path, 'renameifexists': 1},
-                                         files=files)
+                response = self._api_call('uploadfile', params, files=files)
 
             if response.get('result') == 0:
                 if progress_callback:
@@ -331,7 +436,7 @@ class PCloudClient:
             return False
 
     def upload_files(self, file_paths: List[str], remote_path: str = '/',
-                     progress_callback: Optional[Callable] = None) -> Tuple[int, int]:
+                     progress_callback: Optional[Callable] = None) -> Tuple[int, int, int]:
         """
         Upload multiple files in parallel
 
@@ -341,9 +446,10 @@ class PCloudClient:
             progress_callback: Optional callback for progress updates
 
         Returns:
-            Tuple of (successful_uploads, failed_uploads)
+            Tuple of (uploaded, skipped, failed)
         """
-        successful = 0
+        uploaded = 0
+        skipped = 0
         failed = 0
 
         # Calculate total size
@@ -351,9 +457,13 @@ class PCloudClient:
         stats = TransferStats(total_bytes=total_size, files_total=len(file_paths))
 
         print(f"\n📤 Uploading {len(file_paths)} files ({stats.format_size(total_size)})...")
-        print(f"   Using {self.workers} parallel workers\n")
+        print(f"   Using {self.workers} parallel workers")
+        if self.duplicate_mode != 'rename':
+            print(f"   Duplicate mode: {self.duplicate_mode}\n")
+        else:
+            print()
 
-        def upload_with_progress(file_path: str) -> bool:
+        def upload_with_progress(file_path: str) -> Tuple[bool, str]:
             """Upload file and update progress"""
             def update_progress(bytes_transferred: int):
                 with self.stats_lock:
@@ -361,12 +471,12 @@ class PCloudClient:
                     if progress_callback:
                         progress_callback(stats)
 
-            result = self.upload_file(file_path, remote_path, update_progress)
+            success, status = self.upload_file(file_path, remote_path, update_progress)
 
             with self.stats_lock:
                 stats.files_completed += 1
 
-            return result
+            return success, status
 
         # Upload files in parallel
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
@@ -376,20 +486,24 @@ class PCloudClient:
             for future in as_completed(futures):
                 file_path = futures[future]
                 try:
-                    if future.result():
-                        successful += 1
+                    success, status = future.result()
+                    if status == 'uploaded':
+                        uploaded += 1
                         print(f"✓ {Path(file_path).name} [{stats.files_completed}/{stats.files_total}] - {stats.format_speed()}")
+                    elif status == 'skipped':
+                        skipped += 1
+                        # Already printed in upload_file
                     else:
                         failed += 1
                 except Exception as e:
                     failed += 1
                     print(f"✗ {Path(file_path).name}: {e}")
 
-        print(f"\n✓ Upload complete: {successful} succeeded, {failed} failed")
+        print(f"\n✓ Upload complete: {uploaded} uploaded, {skipped} skipped, {failed} failed")
         print(f"  Total time: {time.time() - stats.start_time:.2f}s")
         print(f"  Average speed: {stats.format_speed()}")
 
-        return successful, failed
+        return uploaded, skipped, failed
 
     def get_download_link(self, file_id: Optional[int] = None,
                          path: Optional[str] = None) -> Optional[str]:
@@ -426,7 +540,7 @@ class PCloudClient:
         return None
 
     def download_file(self, remote_path: str, local_path: str,
-                     progress_callback: Optional[Callable] = None) -> bool:
+                     progress_callback: Optional[Callable] = None) -> Tuple[bool, str]:
         """
         Download a file from pCloud
 
@@ -436,20 +550,29 @@ class PCloudClient:
             progress_callback: Optional callback for progress updates
 
         Returns:
-            True if download successful
+            Tuple of (success, status_message)
+            status can be: 'downloaded', 'skipped', 'failed'
         """
         # Get download link
         download_url = self.get_download_link(path=remote_path)
 
         if not download_url:
-            return False
+            return False, 'failed'
 
         try:
-            # Download file with streaming
+            # Download file with streaming to get size
             response = requests.get(download_url, stream=True, timeout=300)
             response.raise_for_status()
 
             total_size = int(response.headers.get('content-length', 0))
+
+            # Check for duplicates
+            should_skip, skip_reason = self.should_skip_download(local_path, total_size)
+            if should_skip:
+                print(f"⊘ Skipped {Path(local_path).name}: {skip_reason}")
+                response.close()  # Close the connection
+                return True, 'skipped'
+
             downloaded = 0
 
             local_file = Path(local_path)
@@ -463,13 +586,13 @@ class PCloudClient:
                         if progress_callback:
                             progress_callback(len(chunk))
 
-            return True
+            return True, 'downloaded'
         except Exception as e:
             print(f"✗ Download error for {remote_path}: {e}")
-            return False
+            return False, 'failed'
 
     def download_files(self, remote_files: List[Tuple[str, str]],
-                       progress_callback: Optional[Callable] = None) -> Tuple[int, int]:
+                       progress_callback: Optional[Callable] = None) -> Tuple[int, int, int]:
         """
         Download multiple files in parallel
 
@@ -478,17 +601,22 @@ class PCloudClient:
             progress_callback: Optional callback for progress updates
 
         Returns:
-            Tuple of (successful_downloads, failed_downloads)
+            Tuple of (downloaded, skipped, failed)
         """
-        successful = 0
+        downloaded = 0
+        skipped = 0
         failed = 0
 
         stats = TransferStats(files_total=len(remote_files))
 
         print(f"\n📥 Downloading {len(remote_files)} files...")
-        print(f"   Using {self.workers} parallel workers\n")
+        print(f"   Using {self.workers} parallel workers")
+        if self.duplicate_mode != 'rename':
+            print(f"   Duplicate mode: {self.duplicate_mode}\n")
+        else:
+            print()
 
-        def download_with_progress(remote_path: str, local_path: str) -> bool:
+        def download_with_progress(remote_path: str, local_path: str) -> Tuple[bool, str]:
             """Download file and update progress"""
             def update_progress(bytes_transferred: int):
                 with self.stats_lock:
@@ -496,12 +624,12 @@ class PCloudClient:
                     if progress_callback:
                         progress_callback(stats)
 
-            result = self.download_file(remote_path, local_path, update_progress)
+            success, status = self.download_file(remote_path, local_path, update_progress)
 
             with self.stats_lock:
                 stats.files_completed += 1
 
-            return result
+            return success, status
 
         # Download files in parallel
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
@@ -511,20 +639,24 @@ class PCloudClient:
             for future in as_completed(futures):
                 remote_path, local_path = futures[future]
                 try:
-                    if future.result():
-                        successful += 1
+                    success, status = future.result()
+                    if status == 'downloaded':
+                        downloaded += 1
                         print(f"✓ {Path(remote_path).name} [{stats.files_completed}/{stats.files_total}] - {stats.format_speed()}")
+                    elif status == 'skipped':
+                        skipped += 1
+                        # Already printed in download_file
                     else:
                         failed += 1
                 except Exception as e:
                     failed += 1
                     print(f"✗ {Path(remote_path).name}: {e}")
 
-        print(f"\n✓ Download complete: {successful} succeeded, {failed} failed")
+        print(f"\n✓ Download complete: {downloaded} downloaded, {skipped} skipped, {failed} failed")
         print(f"  Total time: {time.time() - stats.start_time:.2f}s")
         print(f"  Average speed: {stats.format_speed()}")
 
-        return successful, failed
+        return downloaded, skipped, failed
 
 
 if __name__ == '__main__':
