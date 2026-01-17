@@ -29,14 +29,15 @@ class AuthDialog(ctk.CTkToplevel):
         super().__init__(parent)
 
         self.title("pCloud Authentication")
-        self.geometry("500x400")
-        self.resizable(False, False)
+        self.geometry("600x500")
+        self.resizable(True, True)
+        self.minsize(500, 450)  # Set minimum size
 
         # Center the window
         self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - (500 // 2)
-        y = (self.winfo_screenheight() // 2) - (400 // 2)
-        self.geometry(f"500x400+{x}+{y}")
+        x = (self.winfo_screenwidth() // 2) - (600 // 2)
+        y = (self.winfo_screenheight() // 2) - (500 // 2)
+        self.geometry(f"600x500+{x}+{y}")
 
         self.result = None
         self.transient(parent)
@@ -146,14 +147,15 @@ class ProgressDialog(ctk.CTkToplevel):
         super().__init__(parent)
 
         self.title(title)
-        self.geometry("600x400")
-        self.resizable(False, False)
+        self.geometry("700x500")
+        self.resizable(True, True)
+        self.minsize(600, 450)  # Set minimum size
 
         # Center the window
         self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - (600 // 2)
-        y = (self.winfo_screenheight() // 2) - (400 // 2)
-        self.geometry(f"600x400+{x}+{y}")
+        x = (self.winfo_screenwidth() // 2) - (700 // 2)
+        y = (self.winfo_screenheight() // 2) - (500 // 2)
+        self.geometry(f"700x500+{x}+{y}")
 
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -657,14 +659,15 @@ class PCloudGUI(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Settings")
-        dialog.geometry("400x300")
-        dialog.resizable(False, False)
+        dialog.geometry("500x400")
+        dialog.resizable(True, True)
+        dialog.minsize(450, 350)  # Set minimum size
 
         # Center
         dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (300 // 2)
-        dialog.geometry(f"400x300+{x}+{y}")
+        x = (dialog.winfo_screenwidth() // 2) - (500 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (400 // 2)
+        dialog.geometry(f"500x400+{x}+{y}")
 
         dialog.transient(self)
         dialog.grab_set()
