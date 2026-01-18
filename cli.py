@@ -53,7 +53,6 @@ def upload_command(args):
         auth_token=auth_token,
         region=args.region,
         workers=args.workers,
-        chunk_size=args.chunk_size * 1024 * 1024,  # Convert MB to bytes
         duplicate_mode=args.duplicate_mode
     )
 
@@ -234,8 +233,6 @@ Environment Variables:
                               help='Remote folder path (default: /)')
     upload_parser.add_argument('--create-folder', '-c', action='store_true',
                               help='Create remote folder if it doesn\'t exist')
-    upload_parser.add_argument('--chunk-size', type=int, default=10,
-                              help='Chunk size in MB for large files (default: 10)')
     upload_parser.add_argument('--duplicate-mode', choices=['skip', 'overwrite', 'rename'],
                               default='rename',
                               help='How to handle duplicates: skip (skip if exists), overwrite (replace existing), rename (auto-rename) (default: rename)')
