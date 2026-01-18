@@ -11,9 +11,16 @@ from getpass import getpass
 from pcloud_fast_transfer import PCloudClient
 
 
-def upload_command(args):
-    """Handle upload command"""
-    # Get credentials
+def get_credentials(args) -> tuple:
+    """
+    Extract and validate credentials from arguments or environment variables
+
+    Args:
+        args: Parsed command-line arguments
+
+    Returns:
+        Tuple of (username, password, auth_token)
+    """
     username = args.username or os.getenv('PCLOUD_USERNAME')
     password = args.password or os.getenv('PCLOUD_PASSWORD')
     auth_token = args.token or os.getenv('PCLOUD_TOKEN')
@@ -31,6 +38,14 @@ def upload_command(args):
     if username and not password and not auth_token:
         password = getpass("Enter pCloud password: ")
 
+    return username, password, auth_token
+
+
+def upload_command(args):
+    """Handle upload command"""
+    # Get credentials
+    username, password, auth_token = get_credentials(args)
+
     # Initialize client
     client = PCloudClient(
         username=username,
@@ -38,7 +53,7 @@ def upload_command(args):
         auth_token=auth_token,
         region=args.region,
         workers=args.workers,
-        chunk_size=args.chunk_size * 1024 * 1024  # Convert MB to bytes
+        duplicate_mode=args.duplicate_mode
     )
 
     # Collect files to upload
@@ -68,7 +83,7 @@ def upload_command(args):
             print(f"✓ Created folder: {args.remote_path} (ID: {folder_id})")
 
     # Upload files
-    successful, failed = client.upload_files(files_to_upload, args.remote_path)
+    uploaded, skipped, failed = client.upload_files(files_to_upload, args.remote_path)
 
     if failed > 0:
         sys.exit(1)
@@ -77,17 +92,7 @@ def upload_command(args):
 def download_command(args):
     """Handle download command"""
     # Get credentials
-    username = args.username or os.getenv('PCLOUD_USERNAME')
-    password = args.password or os.getenv('PCLOUD_PASSWORD')
-    auth_token = args.token or os.getenv('PCLOUD_TOKEN')
-
-    if not auth_token and not (username and password):
-        print("Error: Authentication required!")
-        sys.exit(1)
-
-    # Prompt for password if username provided but not password
-    if username and not password and not auth_token:
-        password = getpass("Enter pCloud password: ")
+    username, password, auth_token = get_credentials(args)
 
     # Initialize client
     client = PCloudClient(
@@ -95,7 +100,8 @@ def download_command(args):
         password=password,
         auth_token=auth_token,
         region=args.region,
-        workers=args.workers
+        workers=args.workers,
+        duplicate_mode=args.duplicate_mode
     )
 
     # List remote files if directory provided
@@ -124,7 +130,7 @@ def download_command(args):
     Path(args.local_path).mkdir(parents=True, exist_ok=True)
 
     # Download files
-    successful, failed = client.download_files(remote_files)
+    downloaded, skipped, failed = client.download_files(remote_files)
 
     if failed > 0:
         sys.exit(1)
@@ -133,17 +139,7 @@ def download_command(args):
 def list_command(args):
     """Handle list command"""
     # Get credentials
-    username = args.username or os.getenv('PCLOUD_USERNAME')
-    password = args.password or os.getenv('PCLOUD_PASSWORD')
-    auth_token = args.token or os.getenv('PCLOUD_TOKEN')
-
-    if not auth_token and not (username and password):
-        print("Error: Authentication required!")
-        sys.exit(1)
-
-    # Prompt for password if username provided but not password
-    if username and not password and not auth_token:
-        password = getpass("Enter pCloud password: ")
+    username, password, auth_token = get_credentials(args)
 
     # Initialize client
     client = PCloudClient(
@@ -237,8 +233,9 @@ Environment Variables:
                               help='Remote folder path (default: /)')
     upload_parser.add_argument('--create-folder', '-c', action='store_true',
                               help='Create remote folder if it doesn\'t exist')
-    upload_parser.add_argument('--chunk-size', type=int, default=10,
-                              help='Chunk size in MB for large files (default: 10)')
+    upload_parser.add_argument('--duplicate-mode', choices=['skip', 'overwrite', 'rename'],
+                              default='rename',
+                              help='How to handle duplicates: skip (skip if exists), overwrite (replace existing), rename (auto-rename) (default: rename)')
     upload_parser.set_defaults(func=upload_command)
 
     # Download command
@@ -250,6 +247,9 @@ Environment Variables:
                                 help='Local destination path (default: ./downloads)')
     download_parser.add_argument('--all', '-a', action='store_true',
                                 help='Download all files from remote folder')
+    download_parser.add_argument('--duplicate-mode', choices=['skip', 'overwrite', 'rename'],
+                                default='rename',
+                                help='How to handle duplicates: skip (skip if exists), overwrite (replace existing), rename (let OS rename) (default: rename)')
     download_parser.set_defaults(func=download_command)
 
     # List command

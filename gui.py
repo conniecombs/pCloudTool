@@ -160,7 +160,8 @@ class ProgressDialog(ctk.CTkToplevel):
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.is_cancelled = False
+        # Use threading.Event for thread-safe cancellation
+        self.cancelled = threading.Event()
         self._create_widgets()
 
     def _create_widgets(self):
@@ -270,7 +271,7 @@ class ProgressDialog(ctk.CTkToplevel):
 
     def _on_close(self):
         """Handle window close"""
-        self.is_cancelled = True
+        self.cancelled.set()
         self.destroy()
 
 
@@ -289,9 +290,14 @@ class PCloudGUI(ctk.CTk):
         y = (self.winfo_screenheight() // 2) - (700 // 2)
         self.geometry(f"1000x700+{x}+{y}")
 
+        # Thread safety locks
+        self.client_lock = threading.Lock()
+        self.files_lock = threading.Lock()
+
         self.client: Optional[PCloudClient] = None
         self.current_path = "/"
         self.selected_files: List[dict] = []
+        self.duplicate_mode = "rename"  # Default duplicate handling mode
 
         self._create_widgets()
         self._try_auto_login()
@@ -610,7 +616,8 @@ class PCloudGUI(ctk.CTk):
                     region = data.get('region', 'us')
 
                     if token:
-                        self.client = PCloudClient(auth_token=token, region=region, workers=4)
+                        with self.client_lock:
+                            self.client = PCloudClient(auth_token=token, region=region, workers=4, duplicate_mode=self.duplicate_mode)
                         self._update_auth_status(True)
                         self._refresh_browse()
         except Exception as e:
@@ -619,8 +626,9 @@ class PCloudGUI(ctk.CTk):
     def _toggle_auth(self):
         """Toggle authentication"""
         if self.client:
-            # Logout
-            self.client = None
+            # Logout - use lock to prevent race with background threads
+            with self.client_lock:
+                self.client = None
             self._update_auth_status(False)
         else:
             # Login
@@ -630,17 +638,21 @@ class PCloudGUI(ctk.CTk):
             if dialog.result:
                 username, password, region = dialog.result
                 try:
-                    self.client = PCloudClient(
+                    new_client = PCloudClient(
                         username=username,
                         password=password,
                         region=region,
-                        workers=4
+                        workers=4,
+                        duplicate_mode=self.duplicate_mode
                     )
+                    with self.client_lock:
+                        self.client = new_client
                     self._update_auth_status(True)
                     self._refresh_browse()
                 except Exception as e:
                     messagebox.showerror("Authentication Failed", f"Could not authenticate:\n{e}")
-                    self.client = None
+                    with self.client_lock:
+                        self.client = None
 
     def _update_auth_status(self, authenticated: bool):
         """Update authentication status display"""
@@ -659,15 +671,15 @@ class PCloudGUI(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Settings")
-        dialog.geometry("500x400")
+        dialog.geometry("550x550")
         dialog.resizable(True, True)
-        dialog.minsize(450, 350)  # Set minimum size
+        dialog.minsize(500, 500)  # Set minimum size
 
         # Center
         dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (500 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (400 // 2)
-        dialog.geometry(f"500x400+{x}+{y}")
+        x = (dialog.winfo_screenwidth() // 2) - (550 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (550 // 2)
+        dialog.geometry(f"550x550+{x}+{y}")
 
         dialog.transient(self)
         dialog.grab_set()
@@ -711,9 +723,33 @@ class PCloudGUI(ctk.CTk):
         )
         appearance_menu.pack(pady=(0, 20))
 
+        # Duplicate mode
+        ctk.CTkLabel(settings_frame, text="Duplicate Handling:", font=ctk.CTkFont(size=13)).pack(pady=(10, 10), anchor="w")
+
+        duplicate_var = ctk.StringVar(value=self.duplicate_mode)
+        duplicate_menu = ctk.CTkOptionMenu(
+            settings_frame,
+            values=["skip", "overwrite", "rename"],
+            variable=duplicate_var,
+            width=300
+        )
+        duplicate_menu.pack(pady=(0, 10))
+
+        # Duplicate mode help text
+        duplicate_help = ctk.CTkLabel(
+            settings_frame,
+            text="skip: Skip files that already exist\noverwrite: Replace existing files\nrename: Auto-rename new files (file.txt → file (1).txt)",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+            justify="left"
+        )
+        duplicate_help.pack(pady=(0, 20), anchor="w")
+
         def save_settings():
             if self.client:
                 self.client.workers = workers_var.get()
+                self.client.duplicate_mode = duplicate_var.get()
+            self.duplicate_mode = duplicate_var.get()
             ctk.set_appearance_mode(appearance_var.get())
             dialog.destroy()
 
@@ -813,24 +849,34 @@ class PCloudGUI(ctk.CTk):
 
         def upload_task():
             try:
-                total_size = sum(Path(f).stat().st_size for f in self.upload_files_list)
-                stats = TransferStats(total_bytes=total_size, files_total=len(self.upload_files_list))
+                # Get file list and client with thread safety
+                with self.files_lock:
+                    files_to_upload = list(self.upload_files_list)
+
+                total_size = sum(Path(f).stat().st_size for f in files_to_upload)
+                stats = TransferStats(total_bytes=total_size, files_total=len(files_to_upload))
 
                 def progress_callback(s):
-                    if not progress_dialog.is_cancelled:
+                    if not progress_dialog.cancelled.is_set():
                         self.after(0, lambda: progress_dialog.update_progress(s))
 
-                successful, failed = self.client.upload_files(
-                    self.upload_files_list,
+                # Get client with lock
+                with self.client_lock:
+                    client = self.client
+                    if not client:
+                        raise Exception("Client disconnected during upload")
+
+                uploaded, skipped, failed = client.upload_files(
+                    files_to_upload,
                     remote_path,
                     progress_callback
                 )
 
-                if not progress_dialog.is_cancelled:
+                if not progress_dialog.cancelled.is_set():
                     self.after(0, lambda: progress_dialog.destroy())
                     self.after(0, lambda: messagebox.showinfo(
                         "Upload Complete",
-                        f"Upload completed!\n\nSuccessful: {successful}\nFailed: {failed}"
+                        f"Upload completed!\n\nUploaded: {uploaded}\nSkipped: {skipped}\nFailed: {failed}"
                     ))
 
             except Exception as e:
@@ -940,12 +986,13 @@ class PCloudGUI(ctk.CTk):
         """Toggle file selection for download"""
         file_info = (f"{path.rstrip('/')}/{item['name']}", item)
 
-        if selected:
-            if file_info not in self.selected_files:
-                self.selected_files.append(file_info)
-        else:
-            if file_info in self.selected_files:
-                self.selected_files.remove(file_info)
+        with self.files_lock:
+            if selected:
+                if file_info not in self.selected_files:
+                    self.selected_files.append(file_info)
+            else:
+                if file_info in self.selected_files:
+                    self.selected_files.remove(file_info)
 
     def _open_folder(self, path: str):
         """Open a folder in browse view"""
@@ -974,15 +1021,18 @@ class PCloudGUI(ctk.CTk):
             messagebox.showerror("Error", "Please login first")
             return
 
-        if not self.selected_files:
-            messagebox.showwarning("No Files", "Please select files to download")
-            return
+        # Get selected files with thread safety
+        with self.files_lock:
+            if not self.selected_files:
+                messagebox.showwarning("No Files", "Please select files to download")
+                return
+            selected_files_copy = list(self.selected_files)
 
         local_path = self.download_local_path.get().strip()
 
         # Prepare download list
         download_list = []
-        for remote_path, item in self.selected_files:
+        for remote_path, item in selected_files_copy:
             local_file = os.path.join(local_path, item['name'])
             download_list.append((remote_path, local_file))
 
@@ -991,13 +1041,19 @@ class PCloudGUI(ctk.CTk):
 
         def download_task():
             try:
-                successful, failed = self.client.download_files(download_list)
+                # Get client with lock
+                with self.client_lock:
+                    client = self.client
+                    if not client:
+                        raise Exception("Client disconnected during download")
 
-                if not progress_dialog.is_cancelled:
+                downloaded, skipped, failed = client.download_files(download_list)
+
+                if not progress_dialog.cancelled.is_set():
                     self.after(0, lambda: progress_dialog.destroy())
                     self.after(0, lambda: messagebox.showinfo(
                         "Download Complete",
-                        f"Download completed!\n\nSuccessful: {successful}\nFailed: {failed}"
+                        f"Download completed!\n\nDownloaded: {downloaded}\nSkipped: {skipped}\nFailed: {failed}"
                     ))
 
             except Exception as e:
