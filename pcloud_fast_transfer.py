@@ -16,11 +16,19 @@ import json
 import hashlib
 import time
 import requests
+from requests.adapters import HTTPAdapter
 from typing import Optional, List, Dict, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass
 from threading import Lock
+
+# Try to import keyring for secure token storage
+try:
+    import keyring
+    KEYRING_AVAILABLE = True
+except ImportError:
+    KEYRING_AVAILABLE = False
 
 
 @dataclass
@@ -110,6 +118,17 @@ class PCloudClient:
         self.stats_lock = Lock()
         self.duplicate_mode = duplicate_mode
 
+        # Setup HTTP session with connection pooling
+        self.session = requests.Session()
+        # Configure connection pool size to match workers
+        adapter = HTTPAdapter(
+            pool_connections=max(self.workers, 10),
+            pool_maxsize=max(self.workers * 2, 20),
+            max_retries=0  # We'll handle retries ourselves
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+
         # Cache directory for auth tokens
         self.cache_dir = Path.home() / '.pcloud_fast_transfer'
         self.cache_dir.mkdir(exist_ok=True)
@@ -124,21 +143,63 @@ class PCloudClient:
             self.authenticate()
 
     def _load_cached_token(self) -> Optional[str]:
-        """Load authentication token from cache"""
+        """Load authentication token from secure storage (keyring) or fallback to file cache"""
+        # Try keyring first (most secure)
+        if KEYRING_AVAILABLE:
+            try:
+                token = keyring.get_password("pcloud_fast_transfer", f"{self.region}_auth_token")
+                if token:
+                    return token
+            except Exception as e:
+                print(f"Warning: Could not load token from keyring: {type(e).__name__}: {e}")
+
+        # Fallback to JSON file for backward compatibility
         try:
             if self.token_cache_file.exists():
                 with open(self.token_cache_file, 'r') as f:
                     data = json.load(f)
-                    return data.get('auth_token')
+                    token = data.get('auth_token')
+
+                    # Migrate to keyring if available
+                    if token and KEYRING_AVAILABLE:
+                        try:
+                            keyring.set_password("pcloud_fast_transfer", f"{self.region}_auth_token", token)
+                            # Delete old file after successful migration
+                            self.token_cache_file.unlink()
+                            print("✓ Migrated token to secure keyring storage")
+                        except Exception:
+                            pass  # Keep using file if migration fails
+
+                    return token
+        except json.JSONDecodeError:
+            print(f"Warning: Cached token file is corrupted, will re-authenticate")
+        except PermissionError:
+            print(f"Warning: No permission to read cached token at {self.token_cache_file}")
         except Exception as e:
-            print(f"Warning: Could not load cached token: {e}")
+            print(f"Warning: Could not load cached token: {type(e).__name__}: {e}")
         return None
 
     def _save_cached_token(self, token: str):
-        """Save authentication token to cache"""
+        """Save authentication token to secure storage (keyring) or fallback to file cache"""
+        # Try keyring first (most secure)
+        if KEYRING_AVAILABLE:
+            try:
+                keyring.set_password("pcloud_fast_transfer", f"{self.region}_auth_token", token)
+                # Also save region separately
+                keyring.set_password("pcloud_fast_transfer", "region", self.region)
+                return
+            except Exception as e:
+                print(f"Warning: Could not save token to keyring, using file fallback: {e}")
+
+        # Fallback to JSON file (less secure but works everywhere)
         try:
+            # Set restrictive permissions (owner read/write only)
             with open(self.token_cache_file, 'w') as f:
                 json.dump({'auth_token': token, 'region': self.region}, f)
+
+            # Set file permissions to 600 (owner read/write only) on Unix-like systems
+            if os.name != 'nt':  # Not Windows
+                os.chmod(self.token_cache_file, 0o600)
         except Exception as e:
             print(f"Warning: Could not save token to cache: {e}")
 
@@ -163,11 +224,30 @@ class PCloudClient:
                 print(f"✓ Authenticated successfully")
                 return True
             else:
+                error_code = response.get('result')
                 error = response.get('error', 'Unknown error')
-                print(f"✗ Authentication failed: {error}")
+
+                # Provide specific error messages based on error code
+                if error_code == 2000:
+                    print(f"✗ Authentication failed: Invalid username or password")
+                elif error_code == 2094:
+                    print(f"✗ Authentication failed: Too many login attempts. Try again later")
+                elif 'network' in error.lower() or 'connection' in error.lower():
+                    print(f"✗ Authentication failed: Network error - check your internet connection")
+                else:
+                    print(f"✗ Authentication failed: {error}")
                 return False
+        except requests.exceptions.Timeout:
+            print(f"✗ Authentication failed: Connection timeout - check your internet connection")
+            return False
+        except requests.exceptions.ConnectionError:
+            print(f"✗ Authentication failed: Cannot connect to pCloud servers")
+            return False
+        except KeyError as e:
+            print(f"✗ Authentication failed: Invalid response from server (missing {e})")
+            return False
         except Exception as e:
-            print(f"✗ Authentication error: {e}")
+            print(f"✗ Authentication error: {type(e).__name__}: {e}")
             return False
 
     def _api_call(self, method: str, params: Dict = None, files: Dict = None) -> Dict:
@@ -190,11 +270,11 @@ class PCloudClient:
 
         try:
             if files:
-                # Multipart upload
-                response = requests.post(url, params=params, files=files, timeout=300)
+                # Multipart upload - use session for connection pooling
+                response = self.session.post(url, params=params, files=files, timeout=300)
             else:
-                # Regular API call
-                response = requests.get(url, params=params, timeout=30)
+                # Regular API call - use session for connection pooling
+                response = self.session.get(url, params=params, timeout=30)
 
             response.raise_for_status()
             return response.json()
@@ -560,8 +640,8 @@ class PCloudClient:
             return False, 'failed'
 
         try:
-            # Download file with streaming to get size
-            response = requests.get(download_url, stream=True, timeout=300)
+            # Download file with streaming - use session for connection pooling
+            response = self.session.get(download_url, stream=True, timeout=300)
             response.raise_for_status()
 
             total_size = int(response.headers.get('content-length', 0))

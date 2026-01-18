@@ -11,9 +11,16 @@ from getpass import getpass
 from pcloud_fast_transfer import PCloudClient
 
 
-def upload_command(args):
-    """Handle upload command"""
-    # Get credentials
+def get_credentials(args) -> tuple:
+    """
+    Extract and validate credentials from arguments or environment variables
+
+    Args:
+        args: Parsed command-line arguments
+
+    Returns:
+        Tuple of (username, password, auth_token)
+    """
     username = args.username or os.getenv('PCLOUD_USERNAME')
     password = args.password or os.getenv('PCLOUD_PASSWORD')
     auth_token = args.token or os.getenv('PCLOUD_TOKEN')
@@ -30,6 +37,14 @@ def upload_command(args):
     # Prompt for password if username provided but not password
     if username and not password and not auth_token:
         password = getpass("Enter pCloud password: ")
+
+    return username, password, auth_token
+
+
+def upload_command(args):
+    """Handle upload command"""
+    # Get credentials
+    username, password, auth_token = get_credentials(args)
 
     # Initialize client
     client = PCloudClient(
@@ -78,17 +93,7 @@ def upload_command(args):
 def download_command(args):
     """Handle download command"""
     # Get credentials
-    username = args.username or os.getenv('PCLOUD_USERNAME')
-    password = args.password or os.getenv('PCLOUD_PASSWORD')
-    auth_token = args.token or os.getenv('PCLOUD_TOKEN')
-
-    if not auth_token and not (username and password):
-        print("Error: Authentication required!")
-        sys.exit(1)
-
-    # Prompt for password if username provided but not password
-    if username and not password and not auth_token:
-        password = getpass("Enter pCloud password: ")
+    username, password, auth_token = get_credentials(args)
 
     # Initialize client
     client = PCloudClient(
@@ -135,17 +140,7 @@ def download_command(args):
 def list_command(args):
     """Handle list command"""
     # Get credentials
-    username = args.username or os.getenv('PCLOUD_USERNAME')
-    password = args.password or os.getenv('PCLOUD_PASSWORD')
-    auth_token = args.token or os.getenv('PCLOUD_TOKEN')
-
-    if not auth_token and not (username and password):
-        print("Error: Authentication required!")
-        sys.exit(1)
-
-    # Prompt for password if username provided but not password
-    if username and not password and not auth_token:
-        password = getpass("Enter pCloud password: ")
+    username, password, auth_token = get_credentials(args)
 
     # Initialize client
     client = PCloudClient(
