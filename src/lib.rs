@@ -810,6 +810,7 @@ impl PCloudClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
 
