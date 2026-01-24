@@ -81,10 +81,12 @@ pub struct FileItem {
     pub isfolder: bool,
     #[serde(default)]
     pub size: u64,
+    // pCloud returns dates as strings like "Sun, 30 Nov 2025 17:33:36 +0000"
+    // We don't currently use these fields, so just accept them as strings
     #[serde(default)]
-    pub hash: Option<u64>,
+    pub created: Option<String>,
     #[serde(default)]
-    pub modified: Option<u64>,
+    pub modified: Option<String>,
     // Allow unknown fields from pCloud API
     #[serde(flatten)]
     #[serde(default)]
