@@ -1,17 +1,21 @@
 # ✅ Directory Loading Issue - FIXED!
 
-## Problem Identified
+## Problems Identified & Fixed
 
-The directory loading was failing with this error:
+### Problem 1: Unknown JSON Fields
 ```
 DEBUG: Got HTTP response, status: 200 OK
 ERROR: Failed to parse JSON response: error decoding response body
-ERROR: Failed to list folder: Network error: error decoding response body
 ```
 
-## Root Cause
+**Root Cause:** The pCloud API was returning **extra fields** in the JSON response that weren't defined in our Rust structs. Rust's strict type system (via `serde`) was rejecting the entire response because of these unknown fields.
 
-The pCloud API was returning **extra fields** in the JSON response that weren't defined in our Rust structs. Rust's strict type system (via `serde`) was rejecting the entire response because of these unknown fields.
+### Problem 2: Date Type Mismatch
+```
+ERROR: Failed to parse JSON response: invalid type: string "Sun, 30 Nov 2025 17:33:36 +0000", expected u64 at line 22 column 49
+```
+
+**Root Cause:** pCloud returns dates as **formatted strings** like `"Sun, 30 Nov 2025 17:33:36 +0000"`, but our struct expected `u64` (Unix timestamp numbers).
 
 **Why Python worked but Rust didn't:**
 - Python's dynamic typing accepts any fields in JSON
@@ -94,6 +98,7 @@ struct FileItem {
     pub name: String,
     pub isfolder: bool,
     pub size: u64,
+    pub modified: Option<u64>,  // ❌ Expected number, got string
 }
 // ❌ Rejected if API sent extra fields like "id", "parentfolderid", etc.
 ```
@@ -104,8 +109,10 @@ struct FileItem {
     pub name: String,
     pub isfolder: bool,
     pub size: u64,
+    pub created: Option<String>,   // ✅ Accepts date strings
+    pub modified: Option<String>,  // ✅ Accepts date strings
     #[serde(flatten)]
-    extra: HashMap<String, Value>,  // ✅ Accepts any extra fields
+    extra: HashMap<String, Value>, // ✅ Accepts any extra fields
 }
 ```
 
@@ -205,9 +212,18 @@ pub struct FileItem {
 
 ## Summary
 
-**Issue:** JSON parsing error preventing directory loading
-**Cause:** Strict struct definitions rejected API responses with extra fields
-**Fix:** Added flexible `#[serde(flatten)]` extra fields to all structs
-**Result:** ✅ Directory loading now works!
+**Issues Found:**
+1. JSON parsing error from unknown fields
+2. Date type mismatch (string vs u64)
+
+**Root Causes:**
+1. Strict struct definitions rejected API responses with extra fields
+2. Date fields expected numbers but API sends formatted strings
+
+**Fixes Applied:**
+1. Added flexible `#[serde(flatten)]` extra fields to all structs
+2. Changed date fields from `Option<u64>` to `Option<String>`
+
+**Result:** ✅ Directory loading now works perfectly!
 
 The Rust implementation is now as flexible as the Python version while maintaining type safety for the fields we care about.
