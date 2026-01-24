@@ -28,6 +28,7 @@ enum AppState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TransferProgress {
     total_files: usize,
     finished_files: usize,
@@ -198,6 +199,7 @@ enum Message {
     // Transfer Logic
     StageTransfer(TransferType),
     TransferStarted(usize, u64),
+    #[allow(dead_code)]
     TransferItemFinished(u64, bool),
     TransferCompleted,
     

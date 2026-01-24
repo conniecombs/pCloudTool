@@ -56,8 +56,8 @@ async fn test_list_root_folder() {
     assert!(result.is_ok());
 
     let items = result.unwrap();
-    // Root folder should exist (might be empty)
-    assert!(items.len() >= 0);
+    // Root folder listing should succeed (result is a valid vec, might be empty)
+    drop(items);
 }
 
 #[tokio::test]
