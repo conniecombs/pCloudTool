@@ -361,7 +361,7 @@ impl PCloudClient {
 
     pub async fn download_file(&self, remote_path: &str, local_folder: &str) -> Result<String> {
         let download_url = self.get_download_link(remote_path).await?;
-        let filename = remote_path.split('/').last()
+        let filename = remote_path.split('/').next_back()
             .ok_or_else(|| PCloudError::InvalidPath("Invalid remote path".to_string()))?;
         let local_path = Path::new(local_folder).join(filename);
 
@@ -570,6 +570,3 @@ impl PCloudClient {
         (downloaded, failed)
     }
 }
-
-// Add tokio_util for streaming
-use tokio_util;
