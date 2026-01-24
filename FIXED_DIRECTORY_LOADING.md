@@ -17,8 +17,8 @@ ERROR: Failed to parse JSON response: invalid type: string "Sun, 30 Nov 2025 17:
 
 **Root Cause:** pCloud returns dates as **formatted strings** like `"Sun, 30 Nov 2025 17:33:36 +0000"`, but our struct expected `u64` (Unix timestamp numbers).
 
-**Why Python worked but Rust didn't:**
-- Python's dynamic typing accepts any fields in JSON
+**Why dynamically typed languages worked but Rust didn't:**
+- Dynamic typing accepts any fields in JSON
 - Rust's static typing requires exact struct definitions
 - We were being too strict with our type definitions
 
@@ -226,4 +226,4 @@ pub struct FileItem {
 
 **Result:** ✅ Directory loading now works perfectly!
 
-The Rust implementation is now as flexible as the Python version while maintaining type safety for the fields we care about.
+The Rust implementation is now flexible while maintaining type safety for the fields we care about.

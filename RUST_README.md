@@ -248,17 +248,6 @@ Tested on typical home internet connection (100 Mbps):
 - **Parallel transfers**: ~2 MB per worker thread
 - **GUI application**: ~25-35 MB total
 
-## Comparison: Rust vs Python
-
-| Feature | Python | Rust |
-|---------|--------|------|
-| Memory (large files) | ~File size | ~10 MB |
-| Cold start time | ~1s | ~0.1s |
-| Type safety | Runtime | Compile-time |
-| Error handling | Exceptions | Result types |
-| Async model | asyncio | tokio |
-| Binary size | N/A | ~15 MB |
-
 ## Dependencies
 
 Core dependencies:
@@ -317,5 +306,4 @@ MIT License - See LICENSE file for details
 ## Acknowledgments
 
 - Built with the [pCloud API](https://docs.pcloud.com/)
-- Inspired by the Python implementation in this repository
 - Uses the excellent [Iced](https://github.com/iced-rs/iced) GUI library

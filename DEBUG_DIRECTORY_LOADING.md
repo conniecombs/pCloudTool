@@ -166,20 +166,6 @@ Type       Name                Size
 ...
 ```
 
-## Comparing with Python Version
-
-If the Rust version fails but Python works:
-
-```bash
-# Test Python version
-python cli.py list /
-
-# Compare with Rust version
-./target/release/pcloud-cli list /
-```
-
-This helps identify if it's a credential issue vs implementation issue.
-
 ## Advanced Debugging
 
 ### Enable Full Request Logging
@@ -237,13 +223,7 @@ If the issue persists, collect this information:
    ./target/release/pcloud-cli list / --region eu
    ```
 
-3. **Test with Python version:**
-   ```bash
-   python cli.py list /
-   ```
-   If Python works, compare the debug output.
-
-4. **Clear any cached credentials:**
+3. **Clear any cached credentials:**
    ```bash
    rm -rf ~/.pcloud_fast_transfer/
    ```
