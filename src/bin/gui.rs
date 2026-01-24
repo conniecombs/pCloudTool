@@ -394,7 +394,10 @@ impl PCloudGui {
             }
             Message::DownloadDestSelected(opt) => {
                 if let Some(local_path) = opt {
-                    let item = self.selected_item.clone().unwrap();
+                    let Some(item) = self.selected_item.clone() else {
+                        self.status = Status::Error("No item selected".into());
+                        return Task::none();
+                    };
                     let local_base = local_path.to_string_lossy().to_string();
                     let remote = if self.current_path == "/" { format!("/{}", item.name) } else { format!("{}/{}", self.current_path, item.name) };
 

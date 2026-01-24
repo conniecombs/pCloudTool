@@ -2,11 +2,16 @@ use clap::{Parser, Subcommand};
 use pcloud_rust::{PCloudClient, Region, DuplicateMode};
 use std::path::Path;
 use std::process;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "pcloud-cli")]
 #[command(author, version, about = "pCloud Fast Transfer CLI - High-performance upload/download tool", long_about = None)]
 struct Cli {
+    /// Enable verbose logging (can also use RUST_LOG env var)
+    #[arg(short, long)]
+    verbose: bool,
+
     /// pCloud username (email) - can also use PCLOUD_USERNAME env var
     #[arg(short, long, env = "PCLOUD_USERNAME")]
     username: Option<String>,
@@ -159,6 +164,19 @@ async fn authenticate_client(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Initialize logging
+    let filter = if cli.verbose {
+        EnvFilter::new("pcloud_rust=debug,pcloud_cli=debug")
+    } else {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("pcloud_rust=info,pcloud_cli=info"))
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
 
     let region = parse_region(&cli.region);
 
