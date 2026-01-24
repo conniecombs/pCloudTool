@@ -124,9 +124,13 @@ impl PCloudGui {
                 match res {
                     Ok(list) => {
                         self.file_list = list;
-                        self.status_message = format!("Path: {}", self.current_path);
+                        self.status_message = format!("Path: {} ({} items)", self.current_path, self.file_list.len());
+                        eprintln!("DEBUG: Successfully loaded {} items from {}", self.file_list.len(), self.current_path);
                     }
-                    Err(e) => self.status_message = format!("Error: {}", e),
+                    Err(e) => {
+                        eprintln!("ERROR: Failed to list folder: {}", e);
+                        self.status_message = format!("Error loading folder: {}", e);
+                    }
                 }
                 Task::none()
             }
