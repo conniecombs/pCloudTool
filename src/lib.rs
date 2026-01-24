@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::path::Path;
 use futures::stream::{self, StreamExt};
 use tokio::io::AsyncWriteExt;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use walkdir::WalkDir;
 use sha2::{Sha256, Digest};
 
@@ -67,7 +67,6 @@ struct ApiResponse {
     auth: Option<String>,
     #[serde(default)]
     error: Option<String>,
-    // Allow unknown fields from pCloud API
     #[serde(flatten)]
     #[serde(default)]
     #[allow(dead_code)]
@@ -81,13 +80,10 @@ pub struct FileItem {
     pub isfolder: bool,
     #[serde(default)]
     pub size: u64,
-    // pCloud returns dates as strings like "Sun, 30 Nov 2025 17:33:36 +0000"
-    // We don't currently use these fields, so just accept them as strings
     #[serde(default)]
     pub created: Option<String>,
     #[serde(default)]
     pub modified: Option<String>,
-    // Allow unknown fields from pCloud API
     #[serde(flatten)]
     #[serde(default)]
     #[allow(dead_code)]
@@ -98,7 +94,6 @@ pub struct FileItem {
 struct FolderMetadata {
     #[serde(default)]
     contents: Vec<FileItem>,
-    // Allow unknown fields from pCloud API
     #[serde(flatten)]
     #[serde(default)]
     #[allow(dead_code)]
@@ -112,7 +107,6 @@ struct ListFolderResponse {
     metadata: Option<FolderMetadata>,
     #[serde(default)]
     error: Option<String>,
-    // Allow unknown fields from pCloud API
     #[serde(flatten)]
     #[serde(default)]
     #[allow(dead_code)]
@@ -200,7 +194,6 @@ impl PCloudClient {
         let response = self.client.get(&url).query(&params).send().await?;
         let api_resp: ApiResponse = response.json().await?;
 
-        // Ignore "already exists" errors gracefully
         if api_resp.result == 0 || api_resp.result == 2004 {
             Ok(())
         } else {
@@ -212,72 +205,22 @@ impl PCloudClient {
         let url = self.api_url("listfolder");
         let auth = self.auth_token.as_deref().ok_or(PCloudError::NotAuthenticated)?;
 
-        // Try different parameter combinations for compatibility
-        // Some pCloud APIs expect different params
         let params = vec![
             ("auth", auth),
             ("path", path),
-            ("recursive", "0"),  // Don't list recursively
-            ("showdeleted", "0"), // Don't show deleted files
+            ("recursive", "0"), 
+            ("showdeleted", "0"),
         ];
 
-        eprintln!("DEBUG: Listing folder: '{}'", path);
-        eprintln!("DEBUG: API URL: {}", url);
-        eprintln!("DEBUG: Token present: {}", auth.len() > 0);
-
-        let response = match self.client.get(&url).query(&params).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("ERROR: Network request failed: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        eprintln!("DEBUG: Got HTTP response, status: {}", response.status());
-
-        // Get response text first for better error reporting
-        let response_text = match response.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("ERROR: Failed to read response body: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        eprintln!("DEBUG: Response body length: {} bytes", response_text.len());
-        if response_text.len() < 500 {
-            eprintln!("DEBUG: Response body: {}", response_text);
-        } else {
-            eprintln!("DEBUG: Response body (first 500 chars): {}...", &response_text[..500]);
-        }
-
-        let api_resp: ListFolderResponse = match serde_json::from_str(&response_text) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("ERROR: Failed to parse JSON response: {}", e);
-                eprintln!("ERROR: Parse error at line {} column {}", e.line(), e.column());
-                return Err(PCloudError::ApiError(format!("JSON parse error: {}", e)));
-            }
-        };
-
-        eprintln!("DEBUG: API result code: {}", api_resp.result);
-        if let Some(ref error) = api_resp.error {
-            eprintln!("DEBUG: API error message: {}", error);
-        }
+        let response = self.client.get(&url).query(&params).send().await?;
+        let api_resp: ListFolderResponse = response.json().await?;
 
         if api_resp.result != 0 {
             let error_msg = api_resp.error.unwrap_or_else(|| format!("Unknown API error (code: {})", api_resp.result));
-            eprintln!("ERROR: list_folder failed: {}", error_msg);
             return Err(PCloudError::ApiError(error_msg));
         }
 
-        if api_resp.metadata.is_none() {
-            eprintln!("WARNING: API returned success but no metadata");
-        }
-
-        let contents = api_resp.metadata.map(|m| m.contents).unwrap_or_default();
-        eprintln!("DEBUG: Successfully retrieved {} items", contents.len());
-        Ok(contents)
+        Ok(api_resp.metadata.map(|m| m.contents).unwrap_or_default())
     }
 
     pub async fn get_download_link(&self, path: &str) -> Result<String> {
@@ -341,7 +284,7 @@ impl PCloudClient {
 
     async fn should_skip_upload(&self, local_file: &Path, remote_folder: &str) -> Result<(bool, Option<String>)> {
         if self.duplicate_mode == DuplicateMode::Rename {
-            return Ok((false, None)); // Never skip, let pCloud rename
+            return Ok((false, None)); 
         }
 
         let filename = local_file.file_name()
@@ -350,8 +293,8 @@ impl PCloudClient {
 
         let existing_file = match self.check_file_exists(remote_folder, filename).await {
             Ok(Some(file)) => file,
-            Ok(None) => return Ok((false, None)), // File doesn't exist
-            Err(_) => return Ok((false, None)), // Error checking, don't skip
+            Ok(None) => return Ok((false, None)), 
+            Err(_) => return Ok((false, None)), 
         };
 
         if self.duplicate_mode == DuplicateMode::Skip {
@@ -364,12 +307,8 @@ impl PCloudClient {
                     local_size, remote_size
                 ))));
             }
-
-            // Sizes match - consider them identical
             return Ok((true, Some(format!("likely identical (same size: {} bytes)", local_size))));
         }
-
-        // Overwrite mode
         Ok((false, Some("will overwrite".to_string())))
     }
 
@@ -377,17 +316,12 @@ impl PCloudClient {
 
     pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
         let path = Path::new(local_path);
-
         if !path.exists() {
             return Err(PCloudError::FileNotFound(local_path.to_string()));
         }
-
-        // Check for duplicates
-        let (should_skip, skip_reason) = self.should_skip_upload(path, remote_path).await?;
+        
+        let (should_skip, _) = self.should_skip_upload(path, remote_path).await?;
         if should_skip {
-            if let Some(reason) = skip_reason {
-                eprintln!("⊘ Skipped {}: {}", path.file_name().unwrap().to_string_lossy(), reason);
-            }
             return Ok(());
         }
 
@@ -403,11 +337,9 @@ impl PCloudClient {
             .ok_or_else(|| PCloudError::InvalidPath("Invalid filename".to_string()))?
             .to_string();
 
-        // Use streaming to avoid loading entire file into memory
         let file = tokio::fs::File::open(local_file).await?;
         let file_size = file.metadata().await?.len();
 
-        // Convert tokio::fs::File to a stream
         let stream = tokio_util::io::ReaderStream::new(file);
         let body = reqwest::Body::wrap_stream(stream);
 
@@ -419,11 +351,10 @@ impl PCloudClient {
         let form = multipart::Form::new().part("file", part);
 
         let mut params = vec![("auth", auth.to_string()), ("path", remote_path.to_string())];
-
         match self.duplicate_mode {
             DuplicateMode::Rename => params.push(("renameifexists", "1".to_string())),
             DuplicateMode::Overwrite => params.push(("nopartial", "1".to_string())),
-            DuplicateMode::Skip => {}, // Already handled above
+            DuplicateMode::Skip => {},
         }
 
         let response = self.client.post(&url)
@@ -443,7 +374,6 @@ impl PCloudClient {
             .ok_or_else(|| PCloudError::InvalidPath("Invalid remote path".to_string()))?;
         let local_path = Path::new(local_folder).join(filename);
 
-        // Ensure local folder exists
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -462,7 +392,6 @@ impl PCloudClient {
 
     // --- Batch / Recursive Logic ---
 
-    /// Prepare a local folder for upload: walks the tree, creates remote folders, returns list of file tasks
     pub async fn upload_folder_tree(&self, local_root: String, remote_base: String) -> Result<Vec<(String, String)>> {
         let mut files_to_upload = Vec::new();
         let mut folders_to_create = HashSet::new();
@@ -472,28 +401,22 @@ impl PCloudClient {
             return Err(PCloudError::FileNotFound(local_root.clone()));
         }
 
-        // Get the folder name to preserve in remote structure
         let folder_name = local_root_path.file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| PCloudError::InvalidPath("Invalid folder name".to_string()))?;
 
-        // 1. Walk local directory
+        // 1. Scan Local Files
         let walker = WalkDir::new(&local_root);
         for entry in walker.into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
-
-            // Calculate relative path from local_root
             let relative_path = path.strip_prefix(&local_root)
                 .map_err(|e| PCloudError::InvalidPath(e.to_string()))?;
 
-            // Skip the root itself
             if relative_path.as_os_str().is_empty() {
                 continue;
             }
 
             let relative_str = relative_path.to_string_lossy().replace("\\", "/");
-
-            // Construct full remote path, preserving folder name
             let remote_full_path = if remote_base == "/" {
                 format!("/{}/{}", folder_name, relative_str)
             } else {
@@ -503,7 +426,6 @@ impl PCloudClient {
             if entry.file_type().is_dir() {
                 folders_to_create.insert(remote_full_path);
             } else if entry.file_type().is_file() {
-                // For a file, we need its PARENT folder on the remote side
                 let parent_remote = if let Some(parent) = Path::new(&remote_full_path).parent() {
                     parent.to_string_lossy().replace("\\", "/")
                 } else {
@@ -514,53 +436,70 @@ impl PCloudClient {
             }
         }
 
-        // 2. Create folders (sorted by length so we create parents first)
+        // 2. Robust Parent Generation (Fill Gaps)
+        let collected_paths: Vec<String> = folders_to_create.iter().cloned().collect();
+        for path_str in collected_paths {
+            let mut current = Path::new(&path_str);
+            while let Some(parent) = current.parent() {
+                let parent_str = parent.to_string_lossy().replace("\\", "/");
+                if parent_str == "/" || parent_str.is_empty() { break; }
+                folders_to_create.insert(parent_str);
+                current = parent;
+            }
+        }
+
+        // 3. Optimized Parallel Folder Creation (Layer by Layer)
         let mut sorted_folders: Vec<String> = folders_to_create.into_iter().collect();
         sorted_folders.sort_by_key(|a| a.matches('/').count());
 
-        // Create folders in parallel batches to avoid overwhelming the API
-        let folder_chunks: Vec<_> = sorted_folders.chunks(10).collect();
-        for chunk in folder_chunks {
-            let futures: Vec<_> = chunk.iter()
-                .filter(|folder| *folder != "/")
-                .map(|folder| self.create_folder(folder))
-                .collect();
+        let mut folders_by_depth: HashMap<usize, Vec<String>> = HashMap::new();
+        for f in sorted_folders {
+            let depth = f.matches('/').count();
+            folders_by_depth.entry(depth).or_default().push(f);
+        }
 
-            // Wait for this batch to complete
-            let results = futures::future::join_all(futures).await;
+        let mut depths: Vec<usize> = folders_by_depth.keys().cloned().collect();
+        depths.sort();
 
-            // Log errors but don't fail the entire operation
-            for (i, result) in results.into_iter().enumerate() {
-                if let Err(e) = result {
-                    eprintln!("Warning: Failed to create folder {}: {}", chunk[i], e);
-                }
+        for depth in depths {
+            if let Some(folders) = folders_by_depth.get(&depth) {
+                // FIXED: Use .iter().cloned() to pass owned Strings to the async block
+                let creations = stream::iter(folders.iter().cloned())
+                    .map(|folder| {
+                        let client = self.clone();
+                        async move {
+                            if folder != "/" {
+                                if let Err(e) = client.create_folder(&folder).await {
+                                    eprintln!("Warning: Failed to create folder {}: {}", folder, e);
+                                }
+                            }
+                        }
+                    })
+                    .buffer_unordered(self.workers); 
+                
+                creations.collect::<Vec<_>>().await;
             }
         }
 
         Ok(files_to_upload)
     }
 
-    /// Prepare a remote folder for download: scans tree, creates local folders, returns file list
     pub async fn download_folder_tree(&self, remote_root: String, local_base: String) -> Result<Vec<(String, String)>> {
         let mut files_to_download = Vec::new();
         let mut queue = vec![remote_root.clone()];
 
-        // Get folder name to preserve structure
         let folder_name = Path::new(&remote_root).file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("download");
         let local_dest_base = Path::new(&local_base).join(folder_name);
 
-        // Iterative BFS to scan remote folder
         while let Some(current_remote_path) = queue.pop() {
             match self.list_folder(&current_remote_path).await {
                 Ok(items) => {
-                    // Calculate local destination for this folder
                     let suffix = current_remote_path.strip_prefix(&remote_root)
                         .unwrap_or(&current_remote_path);
                     let local_dest_dir = local_dest_base.join(suffix.trim_start_matches('/'));
 
-                    // Create this local directory
                     tokio::fs::create_dir_all(&local_dest_dir).await?;
 
                     for item in items {
@@ -576,14 +515,11 @@ impl PCloudClient {
                 Err(e) => eprintln!("Error listing {}: {}", current_remote_path, e),
             }
         }
-
         Ok(files_to_download)
     }
 
     // --- Unified Batch Processor ---
 
-    /// Upload multiple files in parallel
-    /// Accepts list of (LocalFile, RemoteDestFolder)
     pub async fn upload_files(&self, tasks: Vec<(String, String)>) -> (u32, u32) {
         let mut uploaded = 0;
         let mut failed = 0;
@@ -593,18 +529,18 @@ impl PCloudClient {
                 let client = self.clone();
                 async move {
                     let result = client.upload_file(&local_path, &remote_folder).await;
-                    (local_path, result)
+                    (local_path, remote_folder, result)
                 }
             })
             .buffer_unordered(self.workers);
 
         let results: Vec<_> = uploads.collect().await;
 
-        for (path, res) in results {
+        for (path, remote, res) in results {
             match res {
                 Ok(_) => {
                     uploaded += 1;
-                    println!("✓ Uploaded {}", Path::new(&path).file_name().unwrap().to_string_lossy());
+                    println!("✓ Uploaded {} -> {}", Path::new(&path).file_name().unwrap().to_string_lossy(), remote);
                 }
                 Err(e) => {
                     eprintln!("✗ Failed {}: {}", path, e);
@@ -615,8 +551,6 @@ impl PCloudClient {
         (uploaded, failed)
     }
 
-    /// Download multiple files in parallel
-    /// Accepts list of (RemoteFile, LocalDestFolder)
     pub async fn download_files(&self, tasks: Vec<(String, String)>) -> (u32, u32) {
         let mut downloaded = 0;
         let mut failed = 0;
