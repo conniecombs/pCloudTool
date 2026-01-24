@@ -1,6 +1,32 @@
 # pCloud Fast Transfer
 
-A high-performance tool for uploading and downloading files to/from pCloud with parallel transfer support. Available with both a **modern GUI** and **command-line interface**.
+A high-performance tool for uploading and downloading files to/from pCloud with parallel transfer support. Available in both **Python** and **Rust** implementations, with modern GUI and command-line interfaces.
+
+## 🦀 NEW: Rust Implementation Available!
+
+For maximum performance and memory efficiency, check out the **Rust version**:
+- ⚡ **10x faster** startup time
+- 💾 **Constant memory usage** (~10 MB) regardless of file size
+- 🛡️ **Memory-safe** by design
+- 📦 **Single binary** with no dependencies
+- 🚀 **Streaming uploads/downloads** for large files
+
+See **[RUST_README.md](RUST_README.md)** for Rust-specific documentation.
+
+## Choose Your Implementation
+
+| Feature | Python | Rust |
+|---------|--------|------|
+| Easy to modify | ✅ | - |
+| Memory usage (large files) | File size | ~10 MB |
+| Startup time | ~1s | ~0.1s |
+| Binary size | N/A | 3-16 MB |
+| Type safety | Runtime | Compile-time |
+| Platform support | All with Python | Linux, macOS, Windows |
+
+---
+
+# Python Implementation
 
 ## Features
 
@@ -339,9 +365,55 @@ This tool uses the official pCloud API. For detailed API documentation, visit:
 - [File Upload](https://docs.pcloud.com/methods/file/uploadfile.html)
 - [File Download](https://docs.pcloud.com/methods/streaming/getfilelink.html)
 
+---
+
+## 🦀 Getting Started with Rust
+
+### Prerequisites
+- Rust 1.70+ ([Install Rust](https://rustup.rs))
+- OpenSSL development libraries
+
+### Quick Start
+
+```bash
+# Build release binaries
+cargo build --release
+
+# Run CLI
+./target/release/pcloud-cli upload myfile.txt --username user@example.com --remote-path /MyFolder
+
+# Run GUI
+./target/release/pcloud-gui
+
+# Or install to system
+cargo install --path .
+```
+
+### CLI Examples
+
+```bash
+# Upload a folder recursively
+pcloud-cli upload ./my-folder --username user@example.com --remote-path /Backup
+
+# Download a folder recursively
+pcloud-cli download my-folder --recursive --remote-path / --local-path ./downloads
+
+# List folder contents
+pcloud-cli list /MyFolder --username user@example.com
+
+# Use environment variables for auth
+export PCLOUD_USERNAME="user@example.com"
+export PCLOUD_PASSWORD="your-password"
+pcloud-cli upload file.txt --remote-path /Documents
+```
+
+For complete Rust documentation, see **[RUST_README.md](RUST_README.md)**.
+
+---
+
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+Contributions are welcome for both Python and Rust implementations! Please feel free to submit issues or pull requests.
 
 ## License
 
