@@ -67,6 +67,11 @@ struct ApiResponse {
     auth: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    // Allow unknown fields from pCloud API
+    #[serde(flatten)]
+    #[serde(default)]
+    #[allow(dead_code)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -80,20 +85,36 @@ pub struct FileItem {
     pub hash: Option<u64>,
     #[serde(default)]
     pub modified: Option<u64>,
+    // Allow unknown fields from pCloud API
+    #[serde(flatten)]
+    #[serde(default)]
+    #[allow(dead_code)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
 struct FolderMetadata {
     #[serde(default)]
     contents: Vec<FileItem>,
+    // Allow unknown fields from pCloud API
+    #[serde(flatten)]
+    #[serde(default)]
+    #[allow(dead_code)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
 struct ListFolderResponse {
     result: i32,
+    #[serde(default)]
     metadata: Option<FolderMetadata>,
     #[serde(default)]
     error: Option<String>,
+    // Allow unknown fields from pCloud API
+    #[serde(flatten)]
+    #[serde(default)]
+    #[allow(dead_code)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 // --- THE CLIENT ---
@@ -212,11 +233,28 @@ impl PCloudClient {
 
         eprintln!("DEBUG: Got HTTP response, status: {}", response.status());
 
-        let api_resp: ListFolderResponse = match response.json().await {
+        // Get response text first for better error reporting
+        let response_text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("ERROR: Failed to read response body: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        eprintln!("DEBUG: Response body length: {} bytes", response_text.len());
+        if response_text.len() < 500 {
+            eprintln!("DEBUG: Response body: {}", response_text);
+        } else {
+            eprintln!("DEBUG: Response body (first 500 chars): {}...", &response_text[..500]);
+        }
+
+        let api_resp: ListFolderResponse = match serde_json::from_str(&response_text) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("ERROR: Failed to parse JSON response: {}", e);
-                return Err(e.into());
+                eprintln!("ERROR: Parse error at line {} column {}", e.line(), e.column());
+                return Err(PCloudError::ApiError(format!("JSON parse error: {}", e)));
             }
         };
 
