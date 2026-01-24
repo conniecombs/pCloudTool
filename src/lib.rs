@@ -188,18 +188,56 @@ impl PCloudClient {
     pub async fn list_folder(&self, path: &str) -> Result<Vec<FileItem>> {
         let url = self.api_url("listfolder");
         let auth = self.auth_token.as_deref().ok_or(PCloudError::NotAuthenticated)?;
-        let params = [("auth", auth), ("path", path)];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ListFolderResponse = response.json().await?;
+        // Try different parameter combinations for compatibility
+        // Some pCloud APIs expect different params
+        let params = vec![
+            ("auth", auth),
+            ("path", path),
+            ("recursive", "0"),  // Don't list recursively
+            ("showdeleted", "0"), // Don't show deleted files
+        ];
 
-        if api_resp.result != 0 {
-            return Err(PCloudError::ApiError(
-                api_resp.error.unwrap_or_else(|| "Unknown API error".to_string())
-            ));
+        eprintln!("DEBUG: Listing folder: '{}'", path);
+        eprintln!("DEBUG: API URL: {}", url);
+        eprintln!("DEBUG: Token present: {}", auth.len() > 0);
+
+        let response = match self.client.get(&url).query(&params).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("ERROR: Network request failed: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        eprintln!("DEBUG: Got HTTP response, status: {}", response.status());
+
+        let api_resp: ListFolderResponse = match response.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("ERROR: Failed to parse JSON response: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        eprintln!("DEBUG: API result code: {}", api_resp.result);
+        if let Some(ref error) = api_resp.error {
+            eprintln!("DEBUG: API error message: {}", error);
         }
 
-        Ok(api_resp.metadata.map(|m| m.contents).unwrap_or_default())
+        if api_resp.result != 0 {
+            let error_msg = api_resp.error.unwrap_or_else(|| format!("Unknown API error (code: {})", api_resp.result));
+            eprintln!("ERROR: list_folder failed: {}", error_msg);
+            return Err(PCloudError::ApiError(error_msg));
+        }
+
+        if api_resp.metadata.is_none() {
+            eprintln!("WARNING: API returned success but no metadata");
+        }
+
+        let contents = api_resp.metadata.map(|m| m.contents).unwrap_or_default();
+        eprintln!("DEBUG: Successfully retrieved {} items", contents.len());
+        Ok(contents)
     }
 
     pub async fn get_download_link(&self, path: &str) -> Result<String> {
