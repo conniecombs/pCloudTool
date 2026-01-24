@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use pcloud_rust::{PCloudClient, Region, DuplicateMode};
+use pcloud_rust::{DuplicateMode, PCloudClient, Region};
 use std::path::Path;
 use std::process;
 use tracing_subscriber::EnvFilter;
@@ -187,14 +187,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             create_folder,
             duplicate_mode,
         } => {
-            let mut client = authenticate_client(
-                cli.username,
-                cli.password,
-                cli.token,
-                region,
-                cli.workers,
-            )
-            .await?;
+            let mut client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
 
             client.set_duplicate_mode(parse_duplicate_mode(&duplicate_mode));
 
@@ -263,14 +258,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             recursive,
             duplicate_mode,
         } => {
-            let mut client = authenticate_client(
-                cli.username,
-                cli.password,
-                cli.token,
-                region,
-                cli.workers,
-            )
-            .await?;
+            let mut client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
 
             client.set_duplicate_mode(parse_duplicate_mode(&duplicate_mode));
 
@@ -358,14 +348,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::List { path } => {
-            let client = authenticate_client(
-                cli.username,
-                cli.password,
-                cli.token,
-                region,
-                cli.workers,
-            )
-            .await?;
+            let client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
 
             match client.list_folder(&path).await {
                 Ok(items) => {
@@ -399,14 +384,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::CreateFolder { path } => {
-            let client = authenticate_client(
-                cli.username,
-                cli.password,
-                cli.token,
-                region,
-                cli.workers,
-            )
-            .await?;
+            let client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
 
             match client.create_folder(&path).await {
                 Ok(_) => {

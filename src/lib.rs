@@ -41,14 +41,14 @@
 //! }
 //! ```
 
-use reqwest::{Client, multipart};
-use serde::Deserialize;
-use std::path::Path;
 use futures::stream::{self, StreamExt};
+use reqwest::{multipart, Client};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use tokio::io::AsyncWriteExt;
-use std::collections::{HashSet, HashMap};
 use walkdir::WalkDir;
-use sha2::{Sha256, Digest};
 
 const API_US: &str = "https://api.pcloud.com";
 const API_EU: &str = "https://eapi.pcloud.com";
@@ -268,7 +268,10 @@ impl PCloudClient {
             Ok(())
         } else {
             Err(PCloudError::ApiError(
-                response.error.clone().unwrap_or_else(|| format!("Error code: {}", response.result))
+                response
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("Error code: {}", response.result)),
             ))
         }
     }
@@ -303,9 +306,9 @@ impl PCloudClient {
         let api_resp: ApiResponse = response.json().await?;
         Self::ensure_success(&api_resp)?;
 
-        let token = api_resp.auth.ok_or_else(||
-            PCloudError::ApiError("No auth token in response".to_string())
-        )?;
+        let token = api_resp
+            .auth
+            .ok_or_else(|| PCloudError::ApiError("No auth token in response".to_string()))?;
         self.auth_token = Some(token.clone());
         Ok(token)
     }
@@ -320,7 +323,10 @@ impl PCloudClient {
     /// * `path` - The remote folder path (e.g., "/Documents/NewFolder")
     pub async fn create_folder(&self, path: &str) -> Result<()> {
         let url = self.api_url("createfolderifnotexists");
-        let auth = self.auth_token.as_deref().ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth), ("path", path)];
 
         let response = self.client.get(&url).query(&params).send().await?;
@@ -346,12 +352,15 @@ impl PCloudClient {
     /// A vector of `FileItem` structs representing folder contents.
     pub async fn list_folder(&self, path: &str) -> Result<Vec<FileItem>> {
         let url = self.api_url("listfolder");
-        let auth = self.auth_token.as_deref().ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
 
         let params = vec![
             ("auth", auth),
             ("path", path),
-            ("recursive", "0"), 
+            ("recursive", "0"),
             ("showdeleted", "0"),
         ];
 
@@ -359,7 +368,9 @@ impl PCloudClient {
         let api_resp: ListFolderResponse = response.json().await?;
 
         if api_resp.result != 0 {
-            let error_msg = api_resp.error.unwrap_or_else(|| format!("Unknown API error (code: {})", api_resp.result));
+            let error_msg = api_resp
+                .error
+                .unwrap_or_else(|| format!("Unknown API error (code: {})", api_resp.result));
             return Err(PCloudError::ApiError(error_msg));
         }
 
@@ -368,7 +379,10 @@ impl PCloudClient {
 
     pub async fn get_download_link(&self, path: &str) -> Result<String> {
         let url = self.api_url("getfilelink");
-        let auth = self.auth_token.as_deref().ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth), ("path", path)];
 
         #[derive(Deserialize)]
@@ -384,26 +398,31 @@ impl PCloudClient {
         let api_resp: LinkResponse = response.json().await?;
 
         if api_resp.result == 0 {
-            let hosts = api_resp.hosts.ok_or_else(||
-                PCloudError::ApiError("No hosts in response".to_string())
-            )?;
-            let path = api_resp.path.ok_or_else(||
-                PCloudError::ApiError("No path in response".to_string())
-            )?;
+            let hosts = api_resp
+                .hosts
+                .ok_or_else(|| PCloudError::ApiError("No hosts in response".to_string()))?;
+            let path = api_resp
+                .path
+                .ok_or_else(|| PCloudError::ApiError("No path in response".to_string()))?;
             if let Some(host) = hosts.first() {
                 return Ok(format!("https://{}{}", host, path));
             }
         }
-        Err(PCloudError::ApiError(
-            api_resp.error.unwrap_or_else(|| "Unknown error getting link".to_string())
-        ))
+        Err(PCloudError::ApiError(api_resp.error.unwrap_or_else(|| {
+            "Unknown error getting link".to_string()
+        })))
     }
 
     // --- Duplicate Detection ---
 
-    pub async fn check_file_exists(&self, remote_folder: &str, filename: &str) -> Result<Option<FileItem>> {
+    pub async fn check_file_exists(
+        &self,
+        remote_folder: &str,
+        filename: &str,
+    ) -> Result<Option<FileItem>> {
         let contents = self.list_folder(remote_folder).await?;
-        Ok(contents.into_iter()
+        Ok(contents
+            .into_iter()
             .find(|item| !item.isfolder && item.name == filename))
     }
 
@@ -425,19 +444,24 @@ impl PCloudClient {
         Ok(hex::encode(hasher.finalize()))
     }
 
-    async fn should_skip_upload(&self, local_file: &Path, remote_folder: &str) -> Result<(bool, Option<String>)> {
+    async fn should_skip_upload(
+        &self,
+        local_file: &Path,
+        remote_folder: &str,
+    ) -> Result<(bool, Option<String>)> {
         if self.duplicate_mode == DuplicateMode::Rename {
-            return Ok((false, None)); 
+            return Ok((false, None));
         }
 
-        let filename = local_file.file_name()
+        let filename = local_file
+            .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| PCloudError::InvalidPath("Invalid filename".to_string()))?;
 
         let existing_file = match self.check_file_exists(remote_folder, filename).await {
             Ok(Some(file)) => file,
-            Ok(None) => return Ok((false, None)), 
-            Err(_) => return Ok((false, None)), 
+            Ok(None) => return Ok((false, None)),
+            Err(_) => return Ok((false, None)),
         };
 
         if self.duplicate_mode == DuplicateMode::Skip {
@@ -445,12 +469,21 @@ impl PCloudClient {
             let remote_size = existing_file.size;
 
             if local_size != remote_size {
-                return Ok((true, Some(format!(
-                    "exists but different size (local: {}, remote: {})",
-                    local_size, remote_size
-                ))));
+                return Ok((
+                    true,
+                    Some(format!(
+                        "exists but different size (local: {}, remote: {})",
+                        local_size, remote_size
+                    )),
+                ));
             }
-            return Ok((true, Some(format!("likely identical (same size: {} bytes)", local_size))));
+            return Ok((
+                true,
+                Some(format!(
+                    "likely identical (same size: {} bytes)",
+                    local_size
+                )),
+            ));
         }
         Ok((false, Some("will overwrite".to_string())))
     }
@@ -469,7 +502,7 @@ impl PCloudClient {
         if !path.exists() {
             return Err(PCloudError::FileNotFound(local_path.to_string()));
         }
-        
+
         let (should_skip, _) = self.should_skip_upload(path, remote_path).await?;
         if should_skip {
             return Ok(());
@@ -480,9 +513,13 @@ impl PCloudClient {
 
     async fn upload_file_streaming(&self, local_file: &Path, remote_path: &str) -> Result<()> {
         let url = self.api_url("uploadfile");
-        let auth = self.auth_token.as_deref().ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
 
-        let filename = local_file.file_name()
+        let filename = local_file
+            .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| PCloudError::InvalidPath("Invalid filename".to_string()))?
             .to_string();
@@ -500,14 +537,19 @@ impl PCloudClient {
 
         let form = multipart::Form::new().part("file", part);
 
-        let mut params = vec![("auth", auth.to_string()), ("path", remote_path.to_string())];
+        let mut params = vec![
+            ("auth", auth.to_string()),
+            ("path", remote_path.to_string()),
+        ];
         match self.duplicate_mode {
             DuplicateMode::Rename => params.push(("renameifexists", "1".to_string())),
             DuplicateMode::Overwrite => params.push(("nopartial", "1".to_string())),
-            DuplicateMode::Skip => {},
+            DuplicateMode::Skip => {}
         }
 
-        let response = self.client.post(&url)
+        let response = self
+            .client
+            .post(&url)
             .query(&params)
             .multipart(form)
             .send()
@@ -533,7 +575,9 @@ impl PCloudClient {
     /// The full local path of the downloaded file.
     pub async fn download_file(&self, remote_path: &str, local_folder: &str) -> Result<String> {
         let download_url = self.get_download_link(remote_path).await?;
-        let filename = remote_path.split('/').next_back()
+        let filename = remote_path
+            .split('/')
+            .next_back()
             .ok_or_else(|| PCloudError::InvalidPath("Invalid remote path".to_string()))?;
         let local_path = Path::new(local_folder).join(filename);
 
@@ -566,7 +610,11 @@ impl PCloudClient {
     /// # Returns
     ///
     /// A vector of (local_path, remote_folder) tuples for use with `upload_files()`.
-    pub async fn upload_folder_tree(&self, local_root: String, remote_base: String) -> Result<Vec<(String, String)>> {
+    pub async fn upload_folder_tree(
+        &self,
+        local_root: String,
+        remote_base: String,
+    ) -> Result<Vec<(String, String)>> {
         let mut files_to_upload = Vec::new();
         let mut folders_to_create = HashSet::new();
 
@@ -575,7 +623,8 @@ impl PCloudClient {
             return Err(PCloudError::FileNotFound(local_root.clone()));
         }
 
-        let folder_name = local_root_path.file_name()
+        let folder_name = local_root_path
+            .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| PCloudError::InvalidPath("Invalid folder name".to_string()))?;
 
@@ -583,7 +632,8 @@ impl PCloudClient {
         let walker = WalkDir::new(&local_root);
         for entry in walker.into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
-            let relative_path = path.strip_prefix(&local_root)
+            let relative_path = path
+                .strip_prefix(&local_root)
                 .map_err(|e| PCloudError::InvalidPath(e.to_string()))?;
 
             if relative_path.as_os_str().is_empty() {
@@ -594,7 +644,12 @@ impl PCloudClient {
             let remote_full_path = if remote_base == "/" {
                 format!("/{}/{}", folder_name, relative_str)
             } else {
-                format!("{}/{}/{}", remote_base.trim_end_matches('/'), folder_name, relative_str)
+                format!(
+                    "{}/{}/{}",
+                    remote_base.trim_end_matches('/'),
+                    folder_name,
+                    relative_str
+                )
             };
 
             if entry.file_type().is_dir() {
@@ -616,7 +671,9 @@ impl PCloudClient {
             let mut current = Path::new(&path_str);
             while let Some(parent) = current.parent() {
                 let parent_str = parent.to_string_lossy().replace("\\", "/");
-                if parent_str == "/" || parent_str.is_empty() { break; }
+                if parent_str == "/" || parent_str.is_empty() {
+                    break;
+                }
                 folders_to_create.insert(parent_str);
                 current = parent;
             }
@@ -649,8 +706,8 @@ impl PCloudClient {
                             }
                         }
                     })
-                    .buffer_unordered(self.workers); 
-                
+                    .buffer_unordered(self.workers);
+
                 creations.collect::<Vec<_>>().await;
             }
         }
@@ -671,11 +728,16 @@ impl PCloudClient {
     /// # Returns
     ///
     /// A vector of (remote_path, local_folder) tuples for use with `download_files()`.
-    pub async fn download_folder_tree(&self, remote_root: String, local_base: String) -> Result<Vec<(String, String)>> {
+    pub async fn download_folder_tree(
+        &self,
+        remote_root: String,
+        local_base: String,
+    ) -> Result<Vec<(String, String)>> {
         let mut files_to_download = Vec::new();
         let mut queue = vec![remote_root.clone()];
 
-        let folder_name = Path::new(&remote_root).file_name()
+        let folder_name = Path::new(&remote_root)
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("download");
         let local_dest_base = Path::new(&local_base).join(folder_name);
@@ -683,7 +745,8 @@ impl PCloudClient {
         while let Some(current_remote_path) = queue.pop() {
             match self.list_folder(&current_remote_path).await {
                 Ok(items) => {
-                    let suffix = current_remote_path.strip_prefix(&remote_root)
+                    let suffix = current_remote_path
+                        .strip_prefix(&remote_root)
                         .unwrap_or(&current_remote_path);
                     let local_dest_dir = local_dest_base.join(suffix.trim_start_matches('/'));
 
@@ -691,11 +754,22 @@ impl PCloudClient {
 
                     for item in items {
                         if item.isfolder {
-                            let next_path = format!("{}/{}", current_remote_path.trim_end_matches('/'), item.name);
+                            let next_path = format!(
+                                "{}/{}",
+                                current_remote_path.trim_end_matches('/'),
+                                item.name
+                            );
                             queue.push(next_path);
                         } else {
-                            let remote_file_path = format!("{}/{}", current_remote_path.trim_end_matches('/'), item.name);
-                            files_to_download.push((remote_file_path, local_dest_dir.to_string_lossy().to_string()));
+                            let remote_file_path = format!(
+                                "{}/{}",
+                                current_remote_path.trim_end_matches('/'),
+                                item.name
+                            );
+                            files_to_download.push((
+                                remote_file_path,
+                                local_dest_dir.to_string_lossy().to_string(),
+                            ));
                         }
                     }
                 }
@@ -856,10 +930,16 @@ mod tests {
     #[test]
     fn test_api_url() {
         let client = PCloudClient::new(None, Region::US, 8);
-        assert_eq!(client.api_url("listfolder"), "https://api.pcloud.com/listfolder");
+        assert_eq!(
+            client.api_url("listfolder"),
+            "https://api.pcloud.com/listfolder"
+        );
 
         let client_eu = PCloudClient::new(None, Region::EU, 8);
-        assert_eq!(client_eu.api_url("listfolder"), "https://eapi.pcloud.com/listfolder");
+        assert_eq!(
+            client_eu.api_url("listfolder"),
+            "https://eapi.pcloud.com/listfolder"
+        );
     }
 
     #[test]

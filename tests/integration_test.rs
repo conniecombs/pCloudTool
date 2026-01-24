@@ -6,7 +6,7 @@
 //!
 //! Run with: cargo test --test integration_test -- --ignored
 
-use pcloud_rust::{PCloudClient, Region, DuplicateMode, PCloudError};
+use pcloud_rust::{DuplicateMode, PCloudClient, PCloudError, Region};
 use std::env;
 use tempfile::TempDir;
 
@@ -50,7 +50,9 @@ async fn test_login_invalid_credentials() {
 #[tokio::test]
 #[ignore] // Requires credentials
 async fn test_list_root_folder() {
-    let client = get_authenticated_client().await.expect("Failed to authenticate");
+    let client = get_authenticated_client()
+        .await
+        .expect("Failed to authenticate");
 
     let result = client.list_folder("/").await;
     assert!(result.is_ok());
@@ -63,13 +65,18 @@ async fn test_list_root_folder() {
 #[tokio::test]
 #[ignore] // Requires credentials
 async fn test_create_and_list_folder() {
-    let client = get_authenticated_client().await.expect("Failed to authenticate");
+    let client = get_authenticated_client()
+        .await
+        .expect("Failed to authenticate");
 
     // Create a unique test folder
-    let test_folder = format!("/test_folder_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
+    let test_folder = format!(
+        "/test_folder_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
 
     // Create the folder
     let create_result = client.create_folder(&test_folder).await;
@@ -81,13 +88,17 @@ async fn test_create_and_list_folder() {
 
     let items = list_result.unwrap();
     let folder_name = test_folder.trim_start_matches('/');
-    assert!(items.iter().any(|item| item.name == folder_name && item.isfolder));
+    assert!(items
+        .iter()
+        .any(|item| item.name == folder_name && item.isfolder));
 }
 
 #[tokio::test]
 #[ignore] // Requires credentials
 async fn test_upload_and_download_file() {
-    let client = get_authenticated_client().await.expect("Failed to authenticate");
+    let client = get_authenticated_client()
+        .await
+        .expect("Failed to authenticate");
 
     // Create a temporary directory and file
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -96,31 +107,31 @@ async fn test_upload_and_download_file() {
     std::fs::write(&test_file_path, test_content).expect("Failed to write test file");
 
     // Upload the file
-    let upload_result = client.upload_file(
-        test_file_path.to_str().unwrap(),
-        "/"
-    ).await;
+    let upload_result = client
+        .upload_file(test_file_path.to_str().unwrap(), "/")
+        .await;
     assert!(upload_result.is_ok());
 
     // Download the file to a new location
     let download_dir = TempDir::new().expect("Failed to create download dir");
-    let download_result = client.download_file(
-        "/test_upload.txt",
-        download_dir.path().to_str().unwrap()
-    ).await;
+    let download_result = client
+        .download_file("/test_upload.txt", download_dir.path().to_str().unwrap())
+        .await;
     assert!(download_result.is_ok());
 
     // Verify the content
     let downloaded_path = download_dir.path().join("test_upload.txt");
-    let downloaded_content = std::fs::read_to_string(&downloaded_path)
-        .expect("Failed to read downloaded file");
+    let downloaded_content =
+        std::fs::read_to_string(&downloaded_path).expect("Failed to read downloaded file");
     assert_eq!(downloaded_content, test_content);
 }
 
 #[tokio::test]
 #[ignore] // Requires credentials
 async fn test_duplicate_mode_skip() {
-    let mut client = get_authenticated_client().await.expect("Failed to authenticate");
+    let mut client = get_authenticated_client()
+        .await
+        .expect("Failed to authenticate");
     client.set_duplicate_mode(DuplicateMode::Skip);
 
     // Create and upload a test file
@@ -129,11 +140,15 @@ async fn test_duplicate_mode_skip() {
     std::fs::write(&test_file_path, "Original content").expect("Failed to write test file");
 
     // First upload
-    let result1 = client.upload_file(test_file_path.to_str().unwrap(), "/").await;
+    let result1 = client
+        .upload_file(test_file_path.to_str().unwrap(), "/")
+        .await;
     assert!(result1.is_ok());
 
     // Second upload with same file (should be skipped)
-    let result2 = client.upload_file(test_file_path.to_str().unwrap(), "/").await;
+    let result2 = client
+        .upload_file(test_file_path.to_str().unwrap(), "/")
+        .await;
     assert!(result2.is_ok()); // Skip mode doesn't error, just skips
 }
 
