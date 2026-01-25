@@ -94,6 +94,36 @@ enum Commands {
         /// Folder path to create
         path: String,
     },
+
+    /// Delete a file or folder
+    Delete {
+        /// Remote path to delete
+        path: String,
+
+        /// Delete a folder (and all contents) instead of a file
+        #[arg(short, long)]
+        folder: bool,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Move or rename a file or folder
+    Move {
+        /// Source path
+        from: String,
+
+        /// Destination path
+        to: String,
+
+        /// Move a folder instead of a file
+        #[arg(short, long)]
+        folder: bool,
+    },
+
+    /// Show account status and quota information
+    Status,
 }
 
 fn parse_region(region_str: &str) -> Region {
@@ -394,6 +424,106 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     eprintln!("✗ Error creating folder: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        Commands::Delete { path, folder, yes } => {
+            let client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
+
+            // Confirmation prompt unless --yes is specified
+            if !yes {
+                let item_type = if folder { "folder" } else { "file" };
+                eprintln!(
+                    "⚠️  Are you sure you want to delete {} '{}'?",
+                    item_type, path
+                );
+                if folder {
+                    eprintln!("   This will delete all contents recursively!");
+                }
+                eprint!("Type 'yes' to confirm: ");
+
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if input.trim().to_lowercase() != "yes" {
+                    eprintln!("Aborted.");
+                    process::exit(0);
+                }
+            }
+
+            let result = if folder {
+                client.delete_folder(&path).await
+            } else {
+                client.delete_file(&path).await
+            };
+
+            match result {
+                Ok(_) => {
+                    let item_type = if folder { "folder" } else { "file" };
+                    println!("✓ Deleted {}: {}", item_type, path);
+                }
+                Err(e) => {
+                    eprintln!("✗ Error deleting: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        Commands::Move { from, to, folder } => {
+            let client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
+
+            let result = if folder {
+                client.rename_folder(&from, &to).await
+            } else {
+                client.rename_file(&from, &to).await
+            };
+
+            match result {
+                Ok(_) => {
+                    println!("✓ Moved: {} -> {}", from, to);
+                }
+                Err(e) => {
+                    eprintln!("✗ Error moving: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        Commands::Status => {
+            let client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
+
+            match client.get_account_info().await {
+                Ok(info) => {
+                    println!("\n📊 Account Status\n");
+                    println!("Email:     {}", info.email);
+                    println!(
+                        "Plan:      {}",
+                        if info.premium { "Premium" } else { "Free" }
+                    );
+                    println!();
+                    println!("Storage:");
+                    println!("  Used:      {}", format_size(info.used_quota));
+                    println!("  Available: {}", format_size(info.available()));
+                    println!("  Total:     {}", format_size(info.quota));
+                    println!("  Usage:     {:.1}%", info.usage_percent());
+                    println!();
+
+                    // Visual progress bar
+                    let bar_width = 40;
+                    let filled = (info.usage_percent() / 100.0 * bar_width as f64) as usize;
+                    let empty = bar_width - filled;
+                    println!("  [{}{}]", "█".repeat(filled), "░".repeat(empty));
+                    println!();
+                }
+                Err(e) => {
+                    eprintln!("✗ Error getting account info: {}", e);
                     process::exit(1);
                 }
             }

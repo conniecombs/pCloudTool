@@ -24,6 +24,21 @@ enum AppState {
     Dashboard,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SortBy {
+    #[default]
+    Name,
+    Size,
+    Date,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SortOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct TransferProgress {
@@ -68,6 +83,13 @@ struct PCloudGui {
 
     // Active Transfer (currently running)
     active_transfer: Option<TransferType>,
+
+    // Sorting
+    sort_by: SortBy,
+    sort_order: SortOrder,
+
+    // Search/Filter
+    search_filter: String,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +193,14 @@ enum Message {
     ListResult(Result<Vec<FileItem>, String>),
     NavigateTo(String),
     NavigateUp,
+    NavigateToPath(String), // For breadcrumb navigation
+
+    // Sorting
+    SortByChanged(SortBy),
+
+    // Search/Filter
+    SearchFilterChanged(String),
+    ClearSearchFilter,
 
     // Selection
     SelectItem(FileItem),
@@ -190,6 +220,11 @@ enum Message {
 
     DownloadPressed,
     DownloadDestSelected(Option<PathBuf>),
+
+    // Delete
+    DeletePressed,
+    DeleteConfirmed,
+    DeleteResult(Result<(), String>),
 
     // Transfer Logic
     StageTransfer(TransferType),
@@ -218,6 +253,9 @@ impl PCloudGui {
                 active_concurrency: 5,
                 staged_transfer: None,
                 active_transfer: None,
+                sort_by: SortBy::default(),
+                sort_order: SortOrder::default(),
+                search_filter: String::new(),
             },
             Task::none(),
         )
@@ -347,6 +385,32 @@ impl PCloudGui {
                 } else {
                     Task::none()
                 }
+            }
+            Message::NavigateToPath(path) => {
+                self.current_path = path;
+                self.selected_item = None;
+                self.update(Message::RefreshList)
+            }
+            Message::SortByChanged(sort_by) => {
+                if self.sort_by == sort_by {
+                    // If same sort field, toggle order
+                    self.sort_order = match self.sort_order {
+                        SortOrder::Ascending => SortOrder::Descending,
+                        SortOrder::Descending => SortOrder::Ascending,
+                    };
+                } else {
+                    self.sort_by = sort_by;
+                    self.sort_order = SortOrder::Ascending;
+                }
+                Task::none()
+            }
+            Message::SearchFilterChanged(filter) => {
+                self.search_filter = filter;
+                Task::none()
+            }
+            Message::ClearSearchFilter => {
+                self.search_filter.clear();
+                Task::none()
             }
             Message::SelectItem(item) => {
                 self.selected_item = Some(item);
@@ -509,6 +573,58 @@ impl PCloudGui {
                 }
             }
 
+            // --- DELETE FLOW ---
+            Message::DeletePressed => {
+                if let Some(item) = &self.selected_item {
+                    let item_type = if item.isfolder { "folder" } else { "file" };
+                    self.status = Status::Error(format!(
+                        "Delete {}? Press Delete again to confirm",
+                        item_type
+                    ));
+                    Task::none()
+                } else {
+                    self.status = Status::Error("Select item to delete".into());
+                    Task::none()
+                }
+            }
+            Message::DeleteConfirmed => {
+                if let Some(item) = self.selected_item.clone() {
+                    self.status = Status::Working("Deleting...".into());
+                    let client = self.client.clone();
+                    let path = if self.current_path == "/" {
+                        format!("/{}", item.name)
+                    } else {
+                        format!("{}/{}", self.current_path, item.name)
+                    };
+                    let is_folder = item.isfolder;
+
+                    Task::perform(
+                        async move {
+                            if is_folder {
+                                client.delete_folder(&path).await
+                            } else {
+                                client.delete_file(&path).await
+                            }
+                            .map_err(|e| e.to_string())
+                        },
+                        Message::DeleteResult,
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::DeleteResult(result) => match result {
+                Ok(_) => {
+                    self.status = Status::Success("Deleted successfully".into());
+                    self.selected_item = None;
+                    self.update(Message::RefreshList)
+                }
+                Err(e) => {
+                    self.status = Status::Error(format!("Delete failed: {}", e));
+                    Task::none()
+                }
+            },
+
             // --- TRANSFER EXECUTION ---
             Message::StartTransferPressed => {
                 if let Some(tt) = self.staged_transfer.take() {
@@ -639,6 +755,35 @@ impl PCloudGui {
                 btn("⬆️ Upload Folder", Message::UploadFolderPressed),
                 Space::with_height(20),
                 btn("⬇️ Download", Message::DownloadPressed),
+                Space::with_height(5),
+                {
+                    // Delete button - shows confirm state when deletion is pending
+                    let is_confirming =
+                        matches!(&self.status, Status::Error(s) if s.contains("Delete"));
+                    let label = if is_confirming {
+                        "🗑️ Confirm Delete"
+                    } else {
+                        "🗑️ Delete"
+                    };
+                    let msg = if is_confirming {
+                        Message::DeleteConfirmed
+                    } else {
+                        Message::DeletePressed
+                    };
+                    let b = button(text(label).align_x(alignment::Horizontal::Center))
+                        .width(Length::Fill)
+                        .padding(10)
+                        .style(if is_confirming {
+                            style_danger
+                        } else {
+                            style_secondary
+                        });
+                    if !is_busy {
+                        b.on_press(msg)
+                    } else {
+                        b
+                    }
+                },
                 Space::with_height(30),
                 text(format!("Concurrency: {}", self.concurrency_setting))
                     .size(12)
@@ -678,9 +823,43 @@ impl PCloudGui {
     }
 
     fn view_file_list(&self) -> Element<'_, Message> {
-        let list = column(
+        // Filter items based on search filter
+        let filter_lower = self.search_filter.to_lowercase();
+        let filtered_items: Vec<FileItem> = if self.search_filter.is_empty() {
+            self.file_list.clone()
+        } else {
             self.file_list
                 .iter()
+                .filter(|item| item.name.to_lowercase().contains(&filter_lower))
+                .cloned()
+                .collect()
+        };
+
+        // Sort items: folders first, then apply sort criteria
+        let mut sorted_items = filtered_items;
+        sorted_items.sort_by(|a, b| {
+            // Folders always come first
+            match (a.isfolder, b.isfolder) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => {
+                    // Same type, apply sort criteria
+                    let cmp = match self.sort_by {
+                        SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        SortBy::Size => a.size.cmp(&b.size),
+                        SortBy::Date => a.modified.cmp(&b.modified),
+                    };
+                    match self.sort_order {
+                        SortOrder::Ascending => cmp,
+                        SortOrder::Descending => cmp.reverse(),
+                    }
+                }
+            }
+        });
+
+        let list = column(
+            sorted_items
+                .into_iter()
                 .map(|item| {
                     let is_sel = self
                         .selected_item
@@ -688,12 +867,15 @@ impl PCloudGui {
                         .map(|i| i.name == item.name)
                         .unwrap_or(false);
                     let icon = if item.isfolder { "📁" } else { "📄" };
+                    let size = item.size;
+                    let name = item.name.clone();
+                    let isfolder = item.isfolder;
                     let row_c = row![
                         text(icon),
                         Space::with_width(10),
-                        text(&item.name),
+                        text(name.clone()),
                         horizontal_space(),
-                        text(format_bytes(item.size))
+                        text(format_bytes(size))
                             .size(12)
                             .color(Color::from_rgb(0.7, 0.7, 0.7))
                     ]
@@ -715,10 +897,10 @@ impl PCloudGui {
                                 ..Default::default()
                             }
                         })
-                        .on_press(if item.isfolder {
-                            Message::NavigateTo(item.name.clone())
+                        .on_press(if isfolder {
+                            Message::NavigateTo(name)
                         } else {
-                            Message::SelectItem(item.clone())
+                            Message::SelectItem(item)
                         })
                         .into()
                 })
@@ -730,19 +912,137 @@ impl PCloudGui {
     }
 
     fn view_header(&self) -> Element<'_, Message> {
-        row![
-            text(format!("📂 {}", self.current_path)).size(14),
-            horizontal_space(),
-            text(format!("👤 {}", self.username)).size(14),
-            Space::with_width(20),
-            button(text("Logout").size(12))
-                .style(style_secondary)
-                .on_press(Message::LogoutPressed)
-                .padding([5, 10])
+        // Build breadcrumb navigation
+        let breadcrumbs = self.view_breadcrumbs();
+
+        // Sort controls
+        let sort_controls = self.view_sort_controls();
+
+        column![
+            // Top row: breadcrumbs and user info
+            row![
+                breadcrumbs,
+                horizontal_space(),
+                text(format!("👤 {}", self.username)).size(14),
+                Space::with_width(20),
+                button(text("Logout").size(12))
+                    .style(style_secondary)
+                    .on_press(Message::LogoutPressed)
+                    .padding([5, 10])
+            ]
+            .padding(10)
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+            // Sort controls row
+            sort_controls
         ]
-        .padding(10)
+        .into()
+    }
+
+    fn view_breadcrumbs(&self) -> Element<'_, Message> {
+        let mut breadcrumb_row = row![].spacing(2).align_y(Alignment::Center);
+
+        // Always show root
+        breadcrumb_row = breadcrumb_row.push(
+            button(text("🏠").size(14))
+                .style(style_breadcrumb)
+                .padding([2, 6])
+                .on_press(Message::NavigateToPath("/".to_string())),
+        );
+
+        if self.current_path != "/" {
+            let parts: Vec<&str> = self
+                .current_path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let mut accumulated_path = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                accumulated_path = format!("{}/{}", accumulated_path, part);
+                let path_clone = accumulated_path.clone();
+
+                // Add separator
+                breadcrumb_row =
+                    breadcrumb_row.push(text("/").size(14).color(Color::from_rgb(0.5, 0.5, 0.5)));
+
+                // Add clickable breadcrumb (last one is not clickable - it's current)
+                if i == parts.len() - 1 {
+                    breadcrumb_row = breadcrumb_row
+                        .push(text(*part).size(14).color(Color::from_rgb(0.8, 0.8, 0.8)));
+                } else {
+                    breadcrumb_row = breadcrumb_row.push(
+                        button(text(*part).size(14))
+                            .style(style_breadcrumb)
+                            .padding([2, 6])
+                            .on_press(Message::NavigateToPath(path_clone)),
+                    );
+                }
+            }
+        }
+
+        breadcrumb_row.into()
+    }
+
+    fn view_sort_controls(&self) -> Element<'_, Message> {
+        let sort_indicator = match self.sort_order {
+            SortOrder::Ascending => "▲",
+            SortOrder::Descending => "▼",
+        };
+
+        let sort_btn = |label: &str, sort_by: SortBy| {
+            let is_active = self.sort_by == sort_by;
+            let display = if is_active {
+                format!("{} {}", label, sort_indicator)
+            } else {
+                label.to_string()
+            };
+            button(text(display).size(11))
+                .style(if is_active {
+                    style_sort_active
+                } else {
+                    style_sort_inactive
+                })
+                .padding([3, 8])
+                .on_press(Message::SortByChanged(sort_by))
+        };
+
+        // Search input with clear button
+        let search_input = row![
+            text("🔍").size(12),
+            Space::with_width(4),
+            text_input("Filter files...", &self.search_filter)
+                .on_input(Message::SearchFilterChanged)
+                .padding(4)
+                .size(12)
+                .width(Length::Fixed(150.0))
+                .style(style_search_input),
+            if !self.search_filter.is_empty() {
+                button(text("✕").size(10))
+                    .style(style_clear_btn)
+                    .padding([2, 6])
+                    .on_press(Message::ClearSearchFilter)
+            } else {
+                button(text("").size(10))
+                    .style(style_clear_btn)
+                    .padding([2, 6])
+            }
+        ]
+        .align_y(Alignment::Center);
+
+        row![
+            text("Sort:").size(11).color(Color::from_rgb(0.5, 0.5, 0.5)),
+            Space::with_width(8),
+            sort_btn("Name", SortBy::Name),
+            Space::with_width(4),
+            sort_btn("Size", SortBy::Size),
+            Space::with_width(4),
+            sort_btn("Date", SortBy::Date),
+            horizontal_space(),
+            search_input,
+        ]
+        .padding([3, 10])
         .align_y(Alignment::Center)
-        .width(Length::Fill)
         .into()
     }
 
@@ -880,6 +1180,28 @@ fn style_secondary(_: &Theme, s: button::Status) -> button::Style {
         _ => b,
     }
 }
+fn style_danger(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::from_rgb(0.7, 0.2, 0.2).into()),
+        text_color: Color::WHITE,
+        border: iced::Border {
+            radius: 4.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.85, 0.25, 0.25).into()),
+            ..b
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgb(0.6, 0.15, 0.15).into()),
+            ..b
+        },
+        _ => b,
+    }
+}
 fn style_bar(_: &Theme) -> progress_bar::Style {
     progress_bar::Style {
         background: Background::Color(Color::from_rgb(0.2, 0.2, 0.2)),
@@ -888,5 +1210,91 @@ fn style_bar(_: &Theme) -> progress_bar::Style {
             radius: 2.0.into(),
             ..Default::default()
         },
+    }
+}
+fn style_breadcrumb(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        text_color: Color::from_rgb(0.4, 0.7, 1.0),
+        border: iced::Border::default(),
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.2, 0.2, 0.25).into()),
+            text_color: Color::from_rgb(0.5, 0.8, 1.0),
+            border: iced::Border {
+                radius: 3.0.into(),
+                ..Default::default()
+            },
+            ..b
+        },
+        _ => b,
+    }
+}
+fn style_sort_active(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::from_rgb(0.2, 0.35, 0.5).into()),
+        text_color: Color::WHITE,
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.25, 0.4, 0.55).into()),
+            ..b
+        },
+        _ => b,
+    }
+}
+fn style_sort_inactive(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
+        text_color: Color::from_rgb(0.6, 0.6, 0.6),
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.2, 0.2, 0.2).into()),
+            text_color: Color::from_rgb(0.8, 0.8, 0.8),
+            ..b
+        },
+        _ => b,
+    }
+}
+fn style_search_input(_: &Theme, _: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(Color::from_rgb(0.12, 0.12, 0.12)),
+        border: iced::Border {
+            color: Color::from_rgb(0.25, 0.25, 0.25),
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        icon: Color::WHITE,
+        placeholder: Color::from_rgb(0.4, 0.4, 0.4),
+        value: Color::WHITE,
+        selection: Color::from_rgb(0.2, 0.4, 0.8),
+    }
+}
+fn style_clear_btn(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        text_color: Color::from_rgb(0.5, 0.5, 0.5),
+        border: iced::Border::default(),
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            text_color: Color::from_rgb(0.8, 0.3, 0.3),
+            ..b
+        },
+        _ => b,
     }
 }
