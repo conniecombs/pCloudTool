@@ -406,7 +406,7 @@ impl PCloudGui {
                 let client = self.client.clone();
                 let path = self.current_path.clone();
                 Task::perform(
-                    async move { 
+                    async move {
                         let list = client.list_folder(&path).await.map_err(|e| e.to_string())?;
                         Ok(Arc::new(list))
                     },
@@ -888,20 +888,18 @@ impl PCloudGui {
         };
 
         let mut sorted_items = filtered_items;
-        sorted_items.sort_by(|a, b| {
-            match (a.isfolder, b.isfolder) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => {
-                    let cmp = match self.sort_by {
-                        SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                        SortBy::Size => a.size.cmp(&b.size),
-                        SortBy::Date => a.modified.cmp(&b.modified),
-                    };
-                    match self.sort_order {
-                        SortOrder::Ascending => cmp,
-                        SortOrder::Descending => cmp.reverse(),
-                    }
+        sorted_items.sort_by(|a, b| match (a.isfolder, b.isfolder) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let cmp = match self.sort_by {
+                    SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortBy::Size => a.size.cmp(&b.size),
+                    SortBy::Date => a.modified.cmp(&b.modified),
+                };
+                match self.sort_order {
+                    SortOrder::Ascending => cmp,
+                    SortOrder::Descending => cmp.reverse(),
                 }
             }
         });

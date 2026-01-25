@@ -8,10 +8,10 @@ use reqwest::{multipart, Client};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
-use walkdir::WalkDir;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use walkdir::WalkDir;
 
 const API_US: &str = "https://api.pcloud.com";
 const API_EU: &str = "https://eapi.pcloud.com";
@@ -82,7 +82,7 @@ impl<R: AsyncRead + Unpin, F: FnMut(usize) + Unpin> AsyncRead for ProgressReader
         let before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         let after = buf.filled().len();
-        
+
         if let Poll::Ready(Ok(())) = &poll {
             let bytes_read = after - before;
             if bytes_read > 0 {
@@ -295,14 +295,16 @@ impl PCloudClient {
                 Err(e) => {
                     attempt += 1;
                     if attempt > self.retry_config.max_retries {
-                         let retry = match &e {
-                             PCloudError::NetworkError(_) => true,
-                             PCloudError::ApiError(s) => s.starts_with("HTTP error: 5"),
-                             _ => false,
-                         };
-                         if !retry { return Err(e); }
+                        let retry = match &e {
+                            PCloudError::NetworkError(_) => true,
+                            PCloudError::ApiError(s) => s.starts_with("HTTP error: 5"),
+                            _ => false,
+                        };
+                        if !retry {
+                            return Err(e);
+                        }
                     }
-                    
+
                     if attempt > self.retry_config.max_retries {
                         return Err(e);
                     }
@@ -364,7 +366,11 @@ impl PCloudClient {
         ];
 
         let api_resp: ListFolderResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
-        Self::ensure_success(&ApiResponse { result: api_resp.result, auth: None, error: api_resp.error })?;
+        Self::ensure_success(&ApiResponse {
+            result: api_resp.result,
+            auth: None,
+            error: api_resp.error,
+        })?;
 
         Ok(api_resp.metadata.map(|m| m.contents).unwrap_or_default())
     }
@@ -423,7 +429,7 @@ impl PCloudClient {
         let api_resp: AccountInfoResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
 
         if api_resp.result != 0 {
-             return Err(PCloudError::ApiError(api_resp.error.unwrap_or_default()));
+            return Err(PCloudError::ApiError(api_resp.error.unwrap_or_default()));
         }
 
         Ok(AccountInfo {
@@ -460,7 +466,11 @@ impl PCloudClient {
                 }
             }
         }
-        Err(PCloudError::ApiError(api_resp.error.unwrap_or_else(|| "Unknown link error".into())))
+        Err(PCloudError::ApiError(
+            api_resp
+                .error
+                .unwrap_or_else(|| "Unknown link error".into()),
+        ))
     }
 
     // --- Duplicate Detection ---
@@ -479,16 +489,18 @@ impl PCloudClient {
     // --- Uploads ---
 
     pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        self.upload_file_with_progress(local_path, remote_path, |_| {}).await
+        self.upload_file_with_progress(local_path, remote_path, |_| {})
+            .await
     }
 
     pub async fn upload_file_with_progress<F>(
-        &self, 
-        local_path: &str, 
+        &self,
+        local_path: &str,
         remote_path: &str,
-        progress_callback: F
-    ) -> Result<()> 
-    where F: FnMut(usize) + Send + Sync + 'static + Unpin
+        progress_callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) + Send + Sync + 'static + Unpin,
     {
         let path = Path::new(local_path);
         if !path.exists() {
@@ -506,11 +518,20 @@ impl PCloudClient {
                     DuplicateMode::Skip => return Ok(()),
                     DuplicateMode::Overwrite => {
                         let temp_filename = format!("{}.tmp.{}", filename, uuid::Uuid::new_v4());
-                        self.upload_internal(path, remote_path, &temp_filename, progress_callback).await?;
-                        
-                        let full_remote = if remote_path == "/" { format!("/{}", filename) } else { format!("{}/{}", remote_path.trim_end_matches('/'), filename) };
-                        let temp_remote = if remote_path == "/" { format!("/{}", temp_filename) } else { format!("{}/{}", remote_path.trim_end_matches('/'), temp_filename) };
-                        
+                        self.upload_internal(path, remote_path, &temp_filename, progress_callback)
+                            .await?;
+
+                        let full_remote = if remote_path == "/" {
+                            format!("/{}", filename)
+                        } else {
+                            format!("{}/{}", remote_path.trim_end_matches('/'), filename)
+                        };
+                        let temp_remote = if remote_path == "/" {
+                            format!("/{}", temp_filename)
+                        } else {
+                            format!("{}/{}", remote_path.trim_end_matches('/'), temp_filename)
+                        };
+
                         let _ = self.delete_file(&full_remote).await;
                         self.rename_file(&temp_remote, &full_remote).await?;
                         return Ok(());
@@ -520,20 +541,25 @@ impl PCloudClient {
             }
         }
 
-        self.upload_internal(path, remote_path, filename, progress_callback).await
+        self.upload_internal(path, remote_path, filename, progress_callback)
+            .await
     }
 
     async fn upload_internal<F>(
-        &self, 
-        local_file: &Path, 
-        remote_path: &str, 
+        &self,
+        local_file: &Path,
+        remote_path: &str,
         filename: &str,
-        progress_callback: F
-    ) -> Result<()> 
-    where F: FnMut(usize) + Send + Sync + 'static + Unpin
+        progress_callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) + Send + Sync + 'static + Unpin,
     {
         let url = self.api_url("uploadfile");
-        let auth = self.auth_token.as_deref().ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
 
         let file = tokio::fs::File::open(local_file).await?;
         let file_size = file.metadata().await?.len();
@@ -555,7 +581,13 @@ impl PCloudClient {
             ("renameifexists", "1".to_string()),
         ];
 
-        let response = self.client.post(&url).query(&params).multipart(form).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .query(&params)
+            .multipart(form)
+            .send()
+            .await?;
         let api_resp: ApiResponse = response.json().await?;
         Self::ensure_success(&api_resp)?;
         Ok(())
@@ -565,7 +597,10 @@ impl PCloudClient {
 
     pub async fn download_file(&self, remote_path: &str, local_folder: &str) -> Result<String> {
         let download_url = self.get_download_link(remote_path).await?;
-        let filename = remote_path.split('/').next_back().ok_or_else(|| PCloudError::InvalidPath("Invalid remote path".into()))?;
+        let filename = remote_path
+            .split('/')
+            .next_back()
+            .ok_or_else(|| PCloudError::InvalidPath("Invalid remote path".into()))?;
         let local_path = Path::new(local_folder).join(filename);
 
         if let Some(parent) = local_path.parent() {
@@ -735,7 +770,7 @@ impl PCloudClient {
                         }
                     }
                 }
-                Err(_e) => {} 
+                Err(_e) => {}
             }
         }
         Ok(files_to_download)
