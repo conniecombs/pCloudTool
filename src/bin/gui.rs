@@ -24,6 +24,21 @@ enum AppState {
     Dashboard,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SortBy {
+    #[default]
+    Name,
+    Size,
+    Date,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SortOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct TransferProgress {
@@ -68,6 +83,10 @@ struct PCloudGui {
 
     // Active Transfer (currently running)
     active_transfer: Option<TransferType>,
+
+    // Sorting
+    sort_by: SortBy,
+    sort_order: SortOrder,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +190,10 @@ enum Message {
     ListResult(Result<Vec<FileItem>, String>),
     NavigateTo(String),
     NavigateUp,
+    NavigateToPath(String), // For breadcrumb navigation
+
+    // Sorting
+    SortByChanged(SortBy),
 
     // Selection
     SelectItem(FileItem),
@@ -223,6 +246,8 @@ impl PCloudGui {
                 active_concurrency: 5,
                 staged_transfer: None,
                 active_transfer: None,
+                sort_by: SortBy::default(),
+                sort_order: SortOrder::default(),
             },
             Task::none(),
         )
@@ -352,6 +377,24 @@ impl PCloudGui {
                 } else {
                     Task::none()
                 }
+            }
+            Message::NavigateToPath(path) => {
+                self.current_path = path;
+                self.selected_item = None;
+                self.update(Message::RefreshList)
+            }
+            Message::SortByChanged(sort_by) => {
+                if self.sort_by == sort_by {
+                    // If same sort field, toggle order
+                    self.sort_order = match self.sort_order {
+                        SortOrder::Ascending => SortOrder::Descending,
+                        SortOrder::Descending => SortOrder::Ascending,
+                    };
+                } else {
+                    self.sort_by = sort_by;
+                    self.sort_order = SortOrder::Ascending;
+                }
+                Task::none()
             }
             Message::SelectItem(item) => {
                 self.selected_item = Some(item);
@@ -764,9 +807,31 @@ impl PCloudGui {
     }
 
     fn view_file_list(&self) -> Element<'_, Message> {
+        // Sort items: folders first, then apply sort criteria
+        let mut sorted_items = self.file_list.clone();
+        sorted_items.sort_by(|a, b| {
+            // Folders always come first
+            match (a.isfolder, b.isfolder) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => {
+                    // Same type, apply sort criteria
+                    let cmp = match self.sort_by {
+                        SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        SortBy::Size => a.size.cmp(&b.size),
+                        SortBy::Date => a.modified.cmp(&b.modified),
+                    };
+                    match self.sort_order {
+                        SortOrder::Ascending => cmp,
+                        SortOrder::Descending => cmp.reverse(),
+                    }
+                }
+            }
+        });
+
         let list = column(
-            self.file_list
-                .iter()
+            sorted_items
+                .into_iter()
                 .map(|item| {
                     let is_sel = self
                         .selected_item
@@ -774,12 +839,15 @@ impl PCloudGui {
                         .map(|i| i.name == item.name)
                         .unwrap_or(false);
                     let icon = if item.isfolder { "📁" } else { "📄" };
+                    let size = item.size;
+                    let name = item.name.clone();
+                    let isfolder = item.isfolder;
                     let row_c = row![
                         text(icon),
                         Space::with_width(10),
-                        text(&item.name),
+                        text(name.clone()),
                         horizontal_space(),
-                        text(format_bytes(item.size))
+                        text(format_bytes(size))
                             .size(12)
                             .color(Color::from_rgb(0.7, 0.7, 0.7))
                     ]
@@ -801,10 +869,10 @@ impl PCloudGui {
                                 ..Default::default()
                             }
                         })
-                        .on_press(if item.isfolder {
-                            Message::NavigateTo(item.name.clone())
+                        .on_press(if isfolder {
+                            Message::NavigateTo(name)
                         } else {
-                            Message::SelectItem(item.clone())
+                            Message::SelectItem(item)
                         })
                         .into()
                 })
@@ -816,19 +884,112 @@ impl PCloudGui {
     }
 
     fn view_header(&self) -> Element<'_, Message> {
-        row![
-            text(format!("📂 {}", self.current_path)).size(14),
-            horizontal_space(),
-            text(format!("👤 {}", self.username)).size(14),
-            Space::with_width(20),
-            button(text("Logout").size(12))
-                .style(style_secondary)
-                .on_press(Message::LogoutPressed)
-                .padding([5, 10])
+        // Build breadcrumb navigation
+        let breadcrumbs = self.view_breadcrumbs();
+
+        // Sort controls
+        let sort_controls = self.view_sort_controls();
+
+        column![
+            // Top row: breadcrumbs and user info
+            row![
+                breadcrumbs,
+                horizontal_space(),
+                text(format!("👤 {}", self.username)).size(14),
+                Space::with_width(20),
+                button(text("Logout").size(12))
+                    .style(style_secondary)
+                    .on_press(Message::LogoutPressed)
+                    .padding([5, 10])
+            ]
+            .padding(10)
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+            // Sort controls row
+            sort_controls
         ]
-        .padding(10)
+        .into()
+    }
+
+    fn view_breadcrumbs(&self) -> Element<'_, Message> {
+        let mut breadcrumb_row = row![].spacing(2).align_y(Alignment::Center);
+
+        // Always show root
+        breadcrumb_row = breadcrumb_row.push(
+            button(text("🏠").size(14))
+                .style(style_breadcrumb)
+                .padding([2, 6])
+                .on_press(Message::NavigateToPath("/".to_string())),
+        );
+
+        if self.current_path != "/" {
+            let parts: Vec<&str> = self
+                .current_path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let mut accumulated_path = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                accumulated_path = format!("{}/{}", accumulated_path, part);
+                let path_clone = accumulated_path.clone();
+
+                // Add separator
+                breadcrumb_row =
+                    breadcrumb_row.push(text("/").size(14).color(Color::from_rgb(0.5, 0.5, 0.5)));
+
+                // Add clickable breadcrumb (last one is not clickable - it's current)
+                if i == parts.len() - 1 {
+                    breadcrumb_row = breadcrumb_row
+                        .push(text(*part).size(14).color(Color::from_rgb(0.8, 0.8, 0.8)));
+                } else {
+                    breadcrumb_row = breadcrumb_row.push(
+                        button(text(*part).size(14))
+                            .style(style_breadcrumb)
+                            .padding([2, 6])
+                            .on_press(Message::NavigateToPath(path_clone)),
+                    );
+                }
+            }
+        }
+
+        breadcrumb_row.into()
+    }
+
+    fn view_sort_controls(&self) -> Element<'_, Message> {
+        let sort_indicator = match self.sort_order {
+            SortOrder::Ascending => "▲",
+            SortOrder::Descending => "▼",
+        };
+
+        let sort_btn = |label: &str, sort_by: SortBy| {
+            let is_active = self.sort_by == sort_by;
+            let display = if is_active {
+                format!("{} {}", label, sort_indicator)
+            } else {
+                label.to_string()
+            };
+            button(text(display).size(11))
+                .style(if is_active {
+                    style_sort_active
+                } else {
+                    style_sort_inactive
+                })
+                .padding([3, 8])
+                .on_press(Message::SortByChanged(sort_by))
+        };
+
+        row![
+            text("Sort:").size(11).color(Color::from_rgb(0.5, 0.5, 0.5)),
+            Space::with_width(8),
+            sort_btn("Name", SortBy::Name),
+            Space::with_width(4),
+            sort_btn("Size", SortBy::Size),
+            Space::with_width(4),
+            sort_btn("Date", SortBy::Date),
+        ]
+        .padding([3, 10])
         .align_y(Alignment::Center)
-        .width(Length::Fill)
         .into()
     }
 
@@ -996,5 +1157,62 @@ fn style_bar(_: &Theme) -> progress_bar::Style {
             radius: 2.0.into(),
             ..Default::default()
         },
+    }
+}
+fn style_breadcrumb(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        text_color: Color::from_rgb(0.4, 0.7, 1.0),
+        border: iced::Border::default(),
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.2, 0.2, 0.25).into()),
+            text_color: Color::from_rgb(0.5, 0.8, 1.0),
+            border: iced::Border {
+                radius: 3.0.into(),
+                ..Default::default()
+            },
+            ..b
+        },
+        _ => b,
+    }
+}
+fn style_sort_active(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::from_rgb(0.2, 0.35, 0.5).into()),
+        text_color: Color::WHITE,
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.25, 0.4, 0.55).into()),
+            ..b
+        },
+        _ => b,
+    }
+}
+fn style_sort_inactive(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
+        text_color: Color::from_rgb(0.6, 0.6, 0.6),
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.2, 0.2, 0.2).into()),
+            text_color: Color::from_rgb(0.8, 0.8, 0.8),
+            ..b
+        },
+        _ => b,
     }
 }
