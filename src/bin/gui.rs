@@ -10,6 +10,7 @@ use iced::{alignment, Alignment, Background, Color, Element, Length, Subscriptio
 use pcloud_rust::{FileItem, PCloudClient, Region};
 use std::hash::Hash;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub fn main() -> iced::Result {
     iced::application("pCloud Fast Transfer", PCloudGui::update, PCloudGui::view)
@@ -47,13 +48,13 @@ struct TransferProgress {
     total_bytes: u64,
     transferred_bytes: u64,
     start_time: Instant,
-    current_speed: f64, // bytes per second
+    current_speed: f64,
 }
 
 #[derive(Debug, Clone)]
 enum Status {
     Idle,
-    ReadyToUpload(usize, u64), // Files selected, count/bytes
+    ReadyToUpload(usize, u64),
     Working(String),
     Transferring(TransferProgress),
     Success(String),
@@ -63,44 +64,28 @@ enum Status {
 struct PCloudGui {
     state: AppState,
     status: Status,
-
-    // Auth Data
     username: String,
     password: String,
-
-    // App Data
     client: PCloudClient,
     current_path: String,
-    file_list: Vec<FileItem>,
+    // FIX: Wrapped in Arc to prevent expensive clones
+    file_list: Arc<Vec<FileItem>>,
     selected_item: Option<FileItem>,
-
-    // Settings
-    concurrency_setting: usize, // The value on the slider
-    active_concurrency: usize,  // The value locked in for the current/active transfer
-
-    // Staged Transfer (waiting for user confirmation)
+    concurrency_setting: usize,
+    active_concurrency: usize,
     staged_transfer: Option<TransferType>,
-
-    // Active Transfer (currently running)
     active_transfer: Option<TransferType>,
-
-    // Sorting
     sort_by: SortBy,
     sort_order: SortOrder,
-
-    // Search/Filter
     search_filter: String,
 }
 
 #[derive(Debug, Clone)]
 enum TransferType {
-    // ID, Local Path, Remote Path, TotalBytes (calculated beforehand)
     Upload(u64, Vec<(PathBuf, String)>, u64),
-    // ID, Remote Path, Local Path, TotalBytes
     Download(u64, Vec<(String, String)>, u64),
 }
 
-// --- RECIPE IMPLEMENTATION ---
 struct TransferRecipe {
     id: u64,
     mode: TransferMode,
@@ -181,58 +166,38 @@ impl Recipe for TransferRecipe {
 
 #[derive(Debug, Clone)]
 enum Message {
-    // Auth
     UsernameChanged(String),
     PasswordChanged(String),
     LoginPressed,
     LoginResult(Result<String, String>),
     LogoutPressed,
-
-    // Navigation
     RefreshList,
-    ListResult(Result<Vec<FileItem>, String>),
+    // FIX: Using Arc<Vec>
+    ListResult(Result<Arc<Vec<FileItem>>, String>),
     NavigateTo(String),
     NavigateUp,
-    NavigateToPath(String), // For breadcrumb navigation
-
-    // Sorting
+    NavigateToPath(String),
     SortByChanged(SortBy),
-
-    // Search/Filter
     SearchFilterChanged(String),
     ClearSearchFilter,
-
-    // Selection
     SelectItem(FileItem),
-
-    // Settings
     ConcurrencyChanged(f64),
-
-    // Actions
     UploadFilePressed,
     UploadFolderPressed,
     UploadSelected(Option<Vec<PathBuf>>),
     UploadFolderSelected(Option<PathBuf>),
-
-    // Explicit Start
     StartTransferPressed,
     CancelTransferPressed,
-
     DownloadPressed,
     DownloadDestSelected(Option<PathBuf>),
-
-    // Delete
     DeletePressed,
     DeleteConfirmed,
     DeleteResult(Result<(), String>),
-
-    // Transfer Logic
     StageTransfer(TransferType),
     TransferStarted(usize, u64),
     #[allow(dead_code)]
     TransferItemFinished(u64, bool),
     TransferCompleted,
-
     OperationFailed(String),
 }
 
@@ -244,10 +209,9 @@ impl PCloudGui {
                 status: Status::Idle,
                 username: String::new(),
                 password: String::new(),
-                // CHANGED: Workers increased to 20 to support full concurrency slider range
                 client: PCloudClient::new(None, Region::US, 20),
                 current_path: "/".to_string(),
-                file_list: Vec::new(),
+                file_list: Arc::new(Vec::new()),
                 selected_item: None,
                 concurrency_setting: 5,
                 active_concurrency: 5,
@@ -350,7 +314,10 @@ impl PCloudGui {
                 let client = self.client.clone();
                 let path = self.current_path.clone();
                 Task::perform(
-                    async move { client.list_folder(&path).await.map_err(|e| e.to_string()) },
+                    async move { 
+                        let list = client.list_folder(&path).await.map_err(|e| e.to_string())?;
+                        Ok(Arc::new(list))
+                    },
                     Message::ListResult,
                 )
             }
@@ -393,7 +360,6 @@ impl PCloudGui {
             }
             Message::SortByChanged(sort_by) => {
                 if self.sort_by == sort_by {
-                    // If same sort field, toggle order
                     self.sort_order = match self.sort_order {
                         SortOrder::Ascending => SortOrder::Descending,
                         SortOrder::Descending => SortOrder::Ascending,
@@ -416,8 +382,6 @@ impl PCloudGui {
                 self.selected_item = Some(item);
                 Task::none()
             }
-
-            // --- UPLOAD FLOW ---
             Message::UploadFilePressed => {
                 self.status = Status::Working("Selecting files...".into());
                 Task::perform(
@@ -442,7 +406,6 @@ impl PCloudGui {
                         .sum();
 
                     let id = gen_id();
-                    // Recursively call update to handle state transition immediately
                     self.update(Message::StageTransfer(TransferType::Upload(
                         id,
                         tasks,
@@ -506,8 +469,6 @@ impl PCloudGui {
                     Task::none()
                 }
             }
-
-            // --- DOWNLOAD FLOW ---
             Message::DownloadPressed => {
                 if self.selected_item.is_some() {
                     self.status = Status::Working("Pick destination...".into());
@@ -560,7 +521,6 @@ impl PCloudGui {
                             },
                         )
                     } else {
-                        // Recursively call update for single file download
                         self.update(Message::StageTransfer(TransferType::Download(
                             gen_id(),
                             vec![(remote, local_base)],
@@ -572,8 +532,6 @@ impl PCloudGui {
                     Task::none()
                 }
             }
-
-            // --- DELETE FLOW ---
             Message::DeletePressed => {
                 if let Some(item) = &self.selected_item {
                     let item_type = if item.isfolder { "folder" } else { "file" };
@@ -624,8 +582,6 @@ impl PCloudGui {
                     Task::none()
                 }
             },
-
-            // --- TRANSFER EXECUTION ---
             Message::StartTransferPressed => {
                 if let Some(tt) = self.staged_transfer.take() {
                     self.active_concurrency = self.concurrency_setting;
@@ -678,11 +634,9 @@ impl PCloudGui {
         if self.state == AppState::Login {
             return self.view_login();
         }
-
         let sidebar = self.view_sidebar();
         let content = self.view_file_list();
         let status = self.view_status_bar();
-
         column![
             self.view_header(),
             horizontal_rule(1),
@@ -757,7 +711,6 @@ impl PCloudGui {
                 btn("⬇️ Download", Message::DownloadPressed),
                 Space::with_height(5),
                 {
-                    // Delete button - shows confirm state when deletion is pending
                     let is_confirming =
                         matches!(&self.status, Status::Error(s) if s.contains("Delete"));
                     let label = if is_confirming {
@@ -823,10 +776,10 @@ impl PCloudGui {
     }
 
     fn view_file_list(&self) -> Element<'_, Message> {
-        // Filter items based on search filter
         let filter_lower = self.search_filter.to_lowercase();
+        // Deref Arc
         let filtered_items: Vec<FileItem> = if self.search_filter.is_empty() {
-            self.file_list.clone()
+            (*self.file_list).clone()
         } else {
             self.file_list
                 .iter()
@@ -835,15 +788,12 @@ impl PCloudGui {
                 .collect()
         };
 
-        // Sort items: folders first, then apply sort criteria
         let mut sorted_items = filtered_items;
         sorted_items.sort_by(|a, b| {
-            // Folders always come first
             match (a.isfolder, b.isfolder) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 _ => {
-                    // Same type, apply sort criteria
                     let cmp = match self.sort_by {
                         SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                         SortBy::Size => a.size.cmp(&b.size),
@@ -912,14 +862,9 @@ impl PCloudGui {
     }
 
     fn view_header(&self) -> Element<'_, Message> {
-        // Build breadcrumb navigation
         let breadcrumbs = self.view_breadcrumbs();
-
-        // Sort controls
         let sort_controls = self.view_sort_controls();
-
         column![
-            // Top row: breadcrumbs and user info
             row![
                 breadcrumbs,
                 horizontal_space(),
@@ -933,7 +878,6 @@ impl PCloudGui {
             .padding(10)
             .align_y(Alignment::Center)
             .width(Length::Fill),
-            // Sort controls row
             sort_controls
         ]
         .into()
@@ -941,8 +885,6 @@ impl PCloudGui {
 
     fn view_breadcrumbs(&self) -> Element<'_, Message> {
         let mut breadcrumb_row = row![].spacing(2).align_y(Alignment::Center);
-
-        // Always show root
         breadcrumb_row = breadcrumb_row.push(
             button(text("🏠").size(14))
                 .style(style_breadcrumb)
@@ -961,12 +903,9 @@ impl PCloudGui {
             for (i, part) in parts.iter().enumerate() {
                 accumulated_path = format!("{}/{}", accumulated_path, part);
                 let path_clone = accumulated_path.clone();
-
-                // Add separator
                 breadcrumb_row =
                     breadcrumb_row.push(text("/").size(14).color(Color::from_rgb(0.5, 0.5, 0.5)));
 
-                // Add clickable breadcrumb (last one is not clickable - it's current)
                 if i == parts.len() - 1 {
                     breadcrumb_row = breadcrumb_row
                         .push(text(*part).size(14).color(Color::from_rgb(0.8, 0.8, 0.8)));
@@ -980,7 +919,6 @@ impl PCloudGui {
                 }
             }
         }
-
         breadcrumb_row.into()
     }
 
@@ -989,7 +927,6 @@ impl PCloudGui {
             SortOrder::Ascending => "▲",
             SortOrder::Descending => "▼",
         };
-
         let sort_btn = |label: &str, sort_by: SortBy| {
             let is_active = self.sort_by == sort_by;
             let display = if is_active {
@@ -1007,7 +944,6 @@ impl PCloudGui {
                 .on_press(Message::SortByChanged(sort_by))
         };
 
-        // Search input with clear button
         let search_input = row![
             text("🔍").size(12),
             Space::with_width(4),
@@ -1062,7 +998,6 @@ impl PCloudGui {
                 ))
                 .size(12),
                 horizontal_space(),
-                // Manual Start Button
                 button(text("Start Transfer").size(12))
                     .padding([5, 15])
                     .style(style_primary)
@@ -1108,7 +1043,6 @@ impl PCloudGui {
     }
 }
 
-// Styles & Helpers
 fn gen_id() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

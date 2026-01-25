@@ -58,6 +58,12 @@ walkdir = "2.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Unique IDs for atomic uploads
+uuid = { version = "1.0", features = ["v4"] }
+
+# CLI Progress bars
+indicatif = "0.17"
+
 [dev-dependencies]
 # Testing utilities
 tokio-test = "0.4"
