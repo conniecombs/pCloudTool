@@ -10,6 +10,7 @@ use iced::{alignment, Alignment, Background, Color, Element, Length, Subscriptio
 use pcloud_rust::{FileItem, PCloudClient, Region};
 use std::hash::Hash;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub fn main() -> iced::Result {
@@ -75,6 +76,7 @@ struct PCloudGui {
     active_concurrency: usize,
     staged_transfer: Option<TransferType>,
     active_transfer: Option<TransferType>,
+    bytes_progress: Arc<AtomicU64>,
     sort_by: SortBy,
     sort_order: SortOrder,
     search_filter: String,
@@ -93,6 +95,7 @@ struct TransferRecipe {
     concurrency: usize,
     total_files: usize,
     total_bytes: u64,
+    bytes_progress: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -117,48 +120,133 @@ impl Recipe for TransferRecipe {
         let concurrency = self.concurrency;
         let t_files = self.total_files;
         let t_bytes = self.total_bytes;
+        let bytes_progress = self.bytes_progress.clone();
 
         match mode {
             TransferMode::Upload(tasks) => {
-                stream::once(async move { Message::TransferStarted(t_files, t_bytes) })
-                    .chain(
-                        stream::iter(tasks)
-                            .map(move |(local, remote)| {
+                // Channel to receive progress updates and file completions
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+                let transfer_stream = async_stream::stream! {
+                    yield Message::TransferStarted(t_files, t_bytes);
+
+                    // Spawn the actual transfer work
+                    let tx_clone = tx.clone();
+                    let bytes_progress_clone = bytes_progress.clone();
+
+                    let transfer_handle = tokio::spawn(async move {
+                        let uploads = stream::iter(tasks)
+                            .map(|(local, remote)| {
                                 let c = client.clone();
+                                let bp = bytes_progress_clone.clone();
+                                let tx_inner = tx_clone.clone();
                                 async move {
-                                    let size =
-                                        std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+                                    let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
                                     let result = c
-                                        .upload_file(local.to_str().unwrap_or_default(), &remote)
+                                        .upload_file_with_progress(
+                                            local.to_str().unwrap_or_default(),
+                                            &remote,
+                                            move |bytes| {
+                                                bp.fetch_add(bytes as u64, Ordering::Relaxed);
+                                            }
+                                        )
                                         .await;
-                                    Message::TransferItemFinished(size, result.is_ok())
+                                    let _ = tx_inner.send(Message::TransferItemFinished(size, result.is_ok()));
                                 }
                             })
-                            .buffer_unordered(concurrency),
-                    )
-                    .chain(stream::once(async { Message::TransferCompleted }))
-                    .boxed()
+                            .buffer_unordered(concurrency);
+
+                        uploads.collect::<Vec<_>>().await;
+                    });
+
+                    // Emit progress updates every 100ms while transfer is running
+                    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+                    let mut files_done = 0usize;
+
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let bytes = bytes_progress.load(Ordering::Relaxed);
+                                yield Message::TransferBytesProgress(bytes);
+                            }
+                            msg = rx.recv() => {
+                                if let Some(Message::TransferItemFinished(size, ok)) = msg {
+                                    files_done += 1;
+                                    yield Message::TransferItemFinished(size, ok);
+                                    if files_done >= t_files {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let _ = transfer_handle.await;
+                    yield Message::TransferCompleted;
+                };
+
+                Box::pin(transfer_stream)
             }
             TransferMode::Download(tasks) => {
-                stream::once(async move { Message::TransferStarted(t_files, t_bytes) })
-                    .chain(
-                        stream::iter(tasks)
-                            .map(move |(remote, local)| {
+                // Channel to receive progress updates and file completions
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+                let transfer_stream = async_stream::stream! {
+                    yield Message::TransferStarted(t_files, t_bytes);
+
+                    let tx_clone = tx.clone();
+                    let bytes_progress_clone = bytes_progress.clone();
+
+                    let transfer_handle = tokio::spawn(async move {
+                        let downloads = stream::iter(tasks)
+                            .map(|(remote, local)| {
                                 let c = client.clone();
+                                let bp = bytes_progress_clone.clone();
+                                let tx_inner = tx_clone.clone();
                                 async move {
                                     let result = c.download_file(&remote, &local).await;
                                     let size = if result.is_ok() {
-                                        std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0)
+                                        let s = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+                                        bp.fetch_add(s, Ordering::Relaxed);
+                                        s
                                     } else {
                                         0
                                     };
-                                    Message::TransferItemFinished(size, result.is_ok())
+                                    let _ = tx_inner.send(Message::TransferItemFinished(size, result.is_ok()));
                                 }
                             })
-                            .buffer_unordered(concurrency),
-                    )
-                    .chain(stream::once(async { Message::TransferCompleted }))
-                    .boxed()
+                            .buffer_unordered(concurrency);
+
+                        downloads.collect::<Vec<_>>().await;
+                    });
+
+                    // Emit progress updates every 100ms while transfer is running
+                    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+                    let mut files_done = 0usize;
+
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let bytes = bytes_progress.load(Ordering::Relaxed);
+                                yield Message::TransferBytesProgress(bytes);
+                            }
+                            msg = rx.recv() => {
+                                if let Some(Message::TransferItemFinished(size, ok)) = msg {
+                                    files_done += 1;
+                                    yield Message::TransferItemFinished(size, ok);
+                                    if files_done >= t_files {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let _ = transfer_handle.await;
+                    yield Message::TransferCompleted;
+                };
+
+                Box::pin(transfer_stream)
             }
         }
     }
@@ -195,6 +283,7 @@ enum Message {
     DeleteResult(Result<(), String>),
     StageTransfer(TransferType),
     TransferStarted(usize, u64),
+    TransferBytesProgress(u64),
     #[allow(dead_code)]
     TransferItemFinished(u64, bool),
     TransferCompleted,
@@ -217,6 +306,7 @@ impl PCloudGui {
                 active_concurrency: 5,
                 staged_transfer: None,
                 active_transfer: None,
+                bytes_progress: Arc::new(AtomicU64::new(0)),
                 sort_by: SortBy::default(),
                 sort_order: SortOrder::default(),
                 search_filter: String::new(),
@@ -244,6 +334,7 @@ impl PCloudGui {
                         concurrency: self.active_concurrency,
                         total_files: tasks.len(),
                         total_bytes: *bytes,
+                        bytes_progress: self.bytes_progress.clone(),
                     })
                 }
                 TransferType::Download(id, tasks, bytes) => {
@@ -254,6 +345,7 @@ impl PCloudGui {
                         concurrency: self.active_concurrency,
                         total_files: tasks.len(),
                         total_bytes: *bytes,
+                        bytes_progress: self.bytes_progress.clone(),
                     })
                 }
             }
@@ -585,6 +677,7 @@ impl PCloudGui {
             Message::StartTransferPressed => {
                 if let Some(tt) = self.staged_transfer.take() {
                     self.active_concurrency = self.concurrency_setting;
+                    self.bytes_progress.store(0, Ordering::Relaxed);
                     self.active_transfer = Some(tt);
                     self.status = Status::Working("Starting transfer...".into());
                 }
@@ -607,14 +700,20 @@ impl PCloudGui {
                 });
                 Task::none()
             }
-            Message::TransferItemFinished(bytes, _) => {
+            Message::TransferBytesProgress(bytes) => {
+                if let Status::Transferring(p) = &mut self.status {
+                    p.transferred_bytes = bytes;
+                    let elapsed = p.start_time.elapsed().as_secs_f64();
+                    if elapsed > 0.1 {
+                        p.current_speed = bytes as f64 / elapsed;
+                    }
+                }
+                Task::none()
+            }
+            Message::TransferItemFinished(_bytes, _) => {
                 if let Status::Transferring(p) = &mut self.status {
                     p.finished_files += 1;
-                    p.transferred_bytes += bytes;
-                    let elapsed = p.start_time.elapsed().as_secs_f64();
-                    if elapsed > 0.0 {
-                        p.current_speed = p.transferred_bytes as f64 / elapsed;
-                    }
+                    // Bytes are now tracked via TransferBytesProgress
                 }
                 Task::none()
             }
@@ -1010,7 +1109,11 @@ impl PCloudGui {
             ]
             .align_y(Alignment::Center),
             Status::Transferring(p) => {
-                let pct = if p.total_files > 0 {
+                // Use byte-level progress for smoother updates
+                let pct = if p.total_bytes > 0 {
+                    (p.transferred_bytes as f32 / p.total_bytes as f32) * 100.0
+                } else if p.total_files > 0 {
+                    // Fallback to file-based progress if total_bytes is unknown
                     (p.finished_files as f32 / p.total_files as f32) * 100.0
                 } else {
                     0.0
@@ -1022,9 +1125,11 @@ impl PCloudGui {
                         .style(style_bar),
                     Space::with_width(10),
                     text(format!(
-                        "{}/{} • {:.1} MB/s",
+                        "{}/{} files • {} / {} • {:.1} MB/s",
                         p.finished_files,
                         p.total_files,
+                        format_bytes(p.transferred_bytes),
+                        format_bytes(p.total_bytes),
                         p.current_speed / 1_000_000.0
                     ))
                     .size(12)
