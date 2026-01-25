@@ -87,6 +87,9 @@ struct PCloudGui {
     // Sorting
     sort_by: SortBy,
     sort_order: SortOrder,
+
+    // Search/Filter
+    search_filter: String,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +198,10 @@ enum Message {
     // Sorting
     SortByChanged(SortBy),
 
+    // Search/Filter
+    SearchFilterChanged(String),
+    ClearSearchFilter,
+
     // Selection
     SelectItem(FileItem),
 
@@ -248,6 +255,7 @@ impl PCloudGui {
                 active_transfer: None,
                 sort_by: SortBy::default(),
                 sort_order: SortOrder::default(),
+                search_filter: String::new(),
             },
             Task::none(),
         )
@@ -394,6 +402,14 @@ impl PCloudGui {
                     self.sort_by = sort_by;
                     self.sort_order = SortOrder::Ascending;
                 }
+                Task::none()
+            }
+            Message::SearchFilterChanged(filter) => {
+                self.search_filter = filter;
+                Task::none()
+            }
+            Message::ClearSearchFilter => {
+                self.search_filter.clear();
                 Task::none()
             }
             Message::SelectItem(item) => {
@@ -807,8 +823,20 @@ impl PCloudGui {
     }
 
     fn view_file_list(&self) -> Element<'_, Message> {
+        // Filter items based on search filter
+        let filter_lower = self.search_filter.to_lowercase();
+        let filtered_items: Vec<FileItem> = if self.search_filter.is_empty() {
+            self.file_list.clone()
+        } else {
+            self.file_list
+                .iter()
+                .filter(|item| item.name.to_lowercase().contains(&filter_lower))
+                .cloned()
+                .collect()
+        };
+
         // Sort items: folders first, then apply sort criteria
-        let mut sorted_items = self.file_list.clone();
+        let mut sorted_items = filtered_items;
         sorted_items.sort_by(|a, b| {
             // Folders always come first
             match (a.isfolder, b.isfolder) {
@@ -979,6 +1007,29 @@ impl PCloudGui {
                 .on_press(Message::SortByChanged(sort_by))
         };
 
+        // Search input with clear button
+        let search_input = row![
+            text("🔍").size(12),
+            Space::with_width(4),
+            text_input("Filter files...", &self.search_filter)
+                .on_input(Message::SearchFilterChanged)
+                .padding(4)
+                .size(12)
+                .width(Length::Fixed(150.0))
+                .style(style_search_input),
+            if !self.search_filter.is_empty() {
+                button(text("✕").size(10))
+                    .style(style_clear_btn)
+                    .padding([2, 6])
+                    .on_press(Message::ClearSearchFilter)
+            } else {
+                button(text("").size(10))
+                    .style(style_clear_btn)
+                    .padding([2, 6])
+            }
+        ]
+        .align_y(Alignment::Center);
+
         row![
             text("Sort:").size(11).color(Color::from_rgb(0.5, 0.5, 0.5)),
             Space::with_width(8),
@@ -987,6 +1038,8 @@ impl PCloudGui {
             sort_btn("Size", SortBy::Size),
             Space::with_width(4),
             sort_btn("Date", SortBy::Date),
+            horizontal_space(),
+            search_input,
         ]
         .padding([3, 10])
         .align_y(Alignment::Center)
@@ -1211,6 +1264,35 @@ fn style_sort_inactive(_: &Theme, s: button::Status) -> button::Style {
         button::Status::Hovered => button::Style {
             background: Some(Color::from_rgb(0.2, 0.2, 0.2).into()),
             text_color: Color::from_rgb(0.8, 0.8, 0.8),
+            ..b
+        },
+        _ => b,
+    }
+}
+fn style_search_input(_: &Theme, _: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(Color::from_rgb(0.12, 0.12, 0.12)),
+        border: iced::Border {
+            color: Color::from_rgb(0.25, 0.25, 0.25),
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        icon: Color::WHITE,
+        placeholder: Color::from_rgb(0.4, 0.4, 0.4),
+        value: Color::WHITE,
+        selection: Color::from_rgb(0.2, 0.4, 0.8),
+    }
+}
+fn style_clear_btn(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        text_color: Color::from_rgb(0.5, 0.5, 0.5),
+        border: iced::Border::default(),
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            text_color: Color::from_rgb(0.8, 0.3, 0.3),
             ..b
         },
         _ => b,
