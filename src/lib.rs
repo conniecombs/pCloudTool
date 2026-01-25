@@ -301,6 +301,8 @@ impl PCloudClient {
         let client = Client::builder()
             .pool_max_idle_per_host(workers)
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(300)) // 5 min for large file transfers
             .build()
             .unwrap_or_default();
 
@@ -360,13 +362,48 @@ impl PCloudClient {
         }
     }
 
+    /// Checks HTTP status and returns an error for non-success status codes.
+    fn check_http_status(response: &reqwest::Response) -> Result<()> {
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(PCloudError::ApiError(format!(
+                "HTTP error: {} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown")
+            )))
+        }
+    }
+
+    /// Sends a GET request and parses the JSON response with proper error handling.
+    async fn api_get<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<T> {
+        let response = self.client.get(url).query(params).send().await?;
+        Self::check_http_status(&response)?;
+        let body = response.text().await?;
+        serde_json::from_str(&body).map_err(|e| {
+            PCloudError::ApiError(format!(
+                "Failed to parse response: {} (body: {})",
+                e,
+                &body[..body.len().min(200)]
+            ))
+        })
+    }
+
     /// Determines if an error is retryable (transient network issues).
-    #[allow(dead_code)]
     fn is_retryable_error(error: &PCloudError) -> bool {
         match error {
             PCloudError::NetworkError(e) => {
                 // Retry on connection errors, timeouts, etc.
                 e.is_timeout() || e.is_connect() || e.is_request()
+            }
+            PCloudError::ApiError(msg) => {
+                // Retry on server errors (5xx)
+                msg.starts_with("HTTP error: 5")
             }
             // Don't retry on auth errors, invalid paths, etc.
             _ => false,
@@ -374,7 +411,6 @@ impl PCloudClient {
     }
 
     /// Executes an async operation with retry logic and exponential backoff.
-    #[allow(dead_code)]
     async fn with_retry<F, Fut, T>(&self, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
@@ -440,8 +476,7 @@ impl PCloudClient {
             ("logout", "1"),
         ];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ApiResponse = response.json().await?;
+        let api_resp: ApiResponse = self.api_get(&url, &params).await?;
         Self::ensure_success(&api_resp)?;
 
         let token = api_resp
@@ -467,8 +502,7 @@ impl PCloudClient {
             .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth), ("path", path)];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ApiResponse = response.json().await?;
+        let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
 
         if api_resp.result == 0 || api_resp.result == 2004 {
             Ok(())
@@ -502,8 +536,7 @@ impl PCloudClient {
             ("showdeleted", "0"),
         ];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ListFolderResponse = response.json().await?;
+        let api_resp: ListFolderResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
 
         if api_resp.result != 0 {
             let error_msg = api_resp
@@ -532,8 +565,7 @@ impl PCloudClient {
             .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth), ("path", path)];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ApiResponse = response.json().await?;
+        let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
@@ -554,8 +586,7 @@ impl PCloudClient {
             .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth), ("path", path)];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ApiResponse = response.json().await?;
+        let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
@@ -577,8 +608,7 @@ impl PCloudClient {
             .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth), ("path", from_path), ("topath", to_path)];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ApiResponse = response.json().await?;
+        let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
@@ -600,8 +630,7 @@ impl PCloudClient {
             .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth), ("path", from_path), ("topath", to_path)];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: ApiResponse = response.json().await?;
+        let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
@@ -618,8 +647,7 @@ impl PCloudClient {
             .ok_or(PCloudError::NotAuthenticated)?;
         let params = [("auth", auth)];
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: AccountInfoResponse = response.json().await?;
+        let api_resp: AccountInfoResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
 
         if api_resp.result != 0 {
             return Err(PCloudError::ApiError(
@@ -654,8 +682,7 @@ impl PCloudClient {
             error: Option<String>,
         }
 
-        let response = self.client.get(&url).query(&params).send().await?;
-        let api_resp: LinkResponse = response.json().await?;
+        let api_resp: LinkResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
 
         if api_resp.result == 0 {
             let hosts = api_resp
@@ -704,50 +731,6 @@ impl PCloudClient {
         Ok(hex::encode(hasher.finalize()))
     }
 
-    async fn should_skip_upload(
-        &self,
-        local_file: &Path,
-        remote_folder: &str,
-    ) -> Result<(bool, Option<String>)> {
-        if self.duplicate_mode == DuplicateMode::Rename {
-            return Ok((false, None));
-        }
-
-        let filename = local_file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| PCloudError::InvalidPath("Invalid filename".to_string()))?;
-
-        let existing_file = match self.check_file_exists(remote_folder, filename).await {
-            Ok(Some(file)) => file,
-            Ok(None) => return Ok((false, None)),
-            Err(_) => return Ok((false, None)),
-        };
-
-        if self.duplicate_mode == DuplicateMode::Skip {
-            let local_size = tokio::fs::metadata(local_file).await?.len();
-            let remote_size = existing_file.size;
-
-            if local_size != remote_size {
-                return Ok((
-                    true,
-                    Some(format!(
-                        "exists but different size (local: {}, remote: {})",
-                        local_size, remote_size
-                    )),
-                ));
-            }
-            return Ok((
-                true,
-                Some(format!(
-                    "likely identical (same size: {} bytes)",
-                    local_size
-                )),
-            ));
-        }
-        Ok((false, Some("will overwrite".to_string())))
-    }
-
     /// Uploads a single file to pCloud.
     ///
     /// Uses streaming I/O for memory-efficient transfers of large files.
@@ -763,9 +746,34 @@ impl PCloudClient {
             return Err(PCloudError::FileNotFound(local_path.to_string()));
         }
 
-        let (should_skip, _) = self.should_skip_upload(path, remote_path).await?;
-        if should_skip {
-            return Ok(());
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| PCloudError::InvalidPath("Invalid filename".to_string()))?;
+
+        // Handle duplicate modes
+        if let Ok(Some(_existing)) = self.check_file_exists(remote_path, filename).await {
+            match self.duplicate_mode {
+                DuplicateMode::Skip => {
+                    tracing::debug!("Skipping existing file: {}", filename);
+                    return Ok(());
+                }
+                DuplicateMode::Overwrite => {
+                    // Delete existing file before upload
+                    let full_path = if remote_path == "/" {
+                        format!("/{}", filename)
+                    } else {
+                        format!("{}/{}", remote_path.trim_end_matches('/'), filename)
+                    };
+                    tracing::debug!("Overwriting existing file: {}", full_path);
+                    if let Err(e) = self.delete_file(&full_path).await {
+                        tracing::warn!("Failed to delete existing file for overwrite: {}", e);
+                    }
+                }
+                DuplicateMode::Rename => {
+                    // Let pCloud handle renaming
+                }
+            }
         }
 
         self.upload_file_streaming(path, remote_path).await
@@ -797,15 +805,12 @@ impl PCloudClient {
 
         let form = multipart::Form::new().part("file", part);
 
-        let mut params = vec![
+        let params = vec![
             ("auth", auth.to_string()),
             ("path", remote_path.to_string()),
+            // Always use renameifexists as a safety net; skip/overwrite handled in upload_file
+            ("renameifexists", "1".to_string()),
         ];
-        match self.duplicate_mode {
-            DuplicateMode::Rename => params.push(("renameifexists", "1".to_string())),
-            DuplicateMode::Overwrite => params.push(("nopartial", "1".to_string())),
-            DuplicateMode::Skip => {}
-        }
 
         let response = self
             .client
@@ -845,16 +850,41 @@ impl PCloudClient {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let response = self.client.get(&download_url).send().await?;
-        let mut file = tokio::fs::File::create(&local_path).await?;
+        // Download with cleanup on failure
+        let result = self.download_to_file(&download_url, &local_path).await;
 
+        if result.is_err() {
+            // Clean up partial download
+            if local_path.exists() {
+                if let Err(e) = tokio::fs::remove_file(&local_path).await {
+                    tracing::warn!(
+                        "Failed to clean up partial download {}: {}",
+                        local_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        result?;
+        Ok(local_path.to_string_lossy().to_string())
+    }
+
+    /// Internal helper to download a URL to a file with retry support.
+    async fn download_to_file(&self, url: &str, local_path: &Path) -> Result<()> {
+        let response = self.client.get(url).send().await?;
+        Self::check_http_status(&response)?;
+
+        let mut file = tokio::fs::File::create(local_path).await?;
         let mut stream = response.bytes_stream();
+
         while let Some(chunk) = stream.next().await {
             let data = chunk?;
             file.write_all(&data).await?;
         }
 
-        Ok(local_path.to_string_lossy().to_string())
+        file.flush().await?;
+        Ok(())
     }
 
     /// Scans a local folder and prepares it for upload.
@@ -1085,17 +1115,6 @@ impl PCloudClient {
         (uploaded, failed)
     }
 
-    /// Downloads multiple files in parallel.
-    ///
-    /// Processes the provided download tasks using the configured number of workers.
-    ///
-    /// # Arguments
-    ///
-    /// * `tasks` - Vector of (remote_path, local_folder) tuples
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (successful_count, failed_count).
     /// Downloads multiple files in parallel.
     ///
     /// Processes the provided download tasks using the configured number of workers.
