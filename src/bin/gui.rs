@@ -191,6 +191,11 @@ enum Message {
     DownloadPressed,
     DownloadDestSelected(Option<PathBuf>),
 
+    // Delete
+    DeletePressed,
+    DeleteConfirmed,
+    DeleteResult(Result<(), String>),
+
     // Transfer Logic
     StageTransfer(TransferType),
     TransferStarted(usize, u64),
@@ -509,6 +514,58 @@ impl PCloudGui {
                 }
             }
 
+            // --- DELETE FLOW ---
+            Message::DeletePressed => {
+                if let Some(item) = &self.selected_item {
+                    let item_type = if item.isfolder { "folder" } else { "file" };
+                    self.status = Status::Error(format!(
+                        "Delete {}? Press Delete again to confirm",
+                        item_type
+                    ));
+                    Task::none()
+                } else {
+                    self.status = Status::Error("Select item to delete".into());
+                    Task::none()
+                }
+            }
+            Message::DeleteConfirmed => {
+                if let Some(item) = self.selected_item.clone() {
+                    self.status = Status::Working("Deleting...".into());
+                    let client = self.client.clone();
+                    let path = if self.current_path == "/" {
+                        format!("/{}", item.name)
+                    } else {
+                        format!("{}/{}", self.current_path, item.name)
+                    };
+                    let is_folder = item.isfolder;
+
+                    Task::perform(
+                        async move {
+                            if is_folder {
+                                client.delete_folder(&path).await
+                            } else {
+                                client.delete_file(&path).await
+                            }
+                            .map_err(|e| e.to_string())
+                        },
+                        Message::DeleteResult,
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::DeleteResult(result) => match result {
+                Ok(_) => {
+                    self.status = Status::Success("Deleted successfully".into());
+                    self.selected_item = None;
+                    self.update(Message::RefreshList)
+                }
+                Err(e) => {
+                    self.status = Status::Error(format!("Delete failed: {}", e));
+                    Task::none()
+                }
+            },
+
             // --- TRANSFER EXECUTION ---
             Message::StartTransferPressed => {
                 if let Some(tt) = self.staged_transfer.take() {
@@ -639,6 +696,35 @@ impl PCloudGui {
                 btn("⬆️ Upload Folder", Message::UploadFolderPressed),
                 Space::with_height(20),
                 btn("⬇️ Download", Message::DownloadPressed),
+                Space::with_height(5),
+                {
+                    // Delete button - shows confirm state when deletion is pending
+                    let is_confirming =
+                        matches!(&self.status, Status::Error(s) if s.contains("Delete"));
+                    let label = if is_confirming {
+                        "🗑️ Confirm Delete"
+                    } else {
+                        "🗑️ Delete"
+                    };
+                    let msg = if is_confirming {
+                        Message::DeleteConfirmed
+                    } else {
+                        Message::DeletePressed
+                    };
+                    let b = button(text(label).align_x(alignment::Horizontal::Center))
+                        .width(Length::Fill)
+                        .padding(10)
+                        .style(if is_confirming {
+                            style_danger
+                        } else {
+                            style_secondary
+                        });
+                    if !is_busy {
+                        b.on_press(msg)
+                    } else {
+                        b
+                    }
+                },
                 Space::with_height(30),
                 text(format!("Concurrency: {}", self.concurrency_setting))
                     .size(12)
@@ -875,6 +961,28 @@ fn style_secondary(_: &Theme, s: button::Status) -> button::Style {
     match s {
         button::Status::Hovered => button::Style {
             background: Some(Color::from_rgb(0.25, 0.25, 0.25).into()),
+            ..b
+        },
+        _ => b,
+    }
+}
+fn style_danger(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::from_rgb(0.7, 0.2, 0.2).into()),
+        text_color: Color::WHITE,
+        border: iced::Border {
+            radius: 4.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.85, 0.25, 0.25).into()),
+            ..b
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgb(0.6, 0.15, 0.15).into()),
             ..b
         },
         _ => b,

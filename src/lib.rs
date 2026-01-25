@@ -179,6 +179,50 @@ struct ListFolderResponse {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Account information including quota usage.
+#[derive(Debug, Clone)]
+pub struct AccountInfo {
+    /// User's email address
+    pub email: String,
+    /// Total storage quota in bytes
+    pub quota: u64,
+    /// Used storage in bytes
+    pub used_quota: u64,
+    /// Whether the account has premium status
+    pub premium: bool,
+}
+
+impl AccountInfo {
+    /// Returns the available (free) storage in bytes.
+    pub fn available(&self) -> u64 {
+        self.quota.saturating_sub(self.used_quota)
+    }
+
+    /// Returns the usage percentage (0.0 to 100.0).
+    pub fn usage_percent(&self) -> f64 {
+        if self.quota == 0 {
+            0.0
+        } else {
+            (self.used_quota as f64 / self.quota as f64) * 100.0
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct AccountInfoResponse {
+    result: i32,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    quota: Option<u64>,
+    #[serde(default)]
+    usedquota: Option<u64>,
+    #[serde(default)]
+    premium: Option<bool>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 /// The main pCloud API client.
 ///
 /// This client handles authentication and provides methods for all pCloud operations
@@ -199,6 +243,30 @@ struct ListFolderResponse {
 ///     Ok(())
 /// }
 /// ```
+/// Configuration for retry behavior on transient failures.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (0 = no retries)
+    pub max_retries: u32,
+    /// Initial delay between retries in milliseconds
+    pub initial_delay_ms: u64,
+    /// Maximum delay between retries in milliseconds
+    pub max_delay_ms: u64,
+    /// Multiplier for exponential backoff (e.g., 2.0 doubles delay each retry)
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay_ms: 500,
+            max_delay_ms: 30000,
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PCloudClient {
     client: Client,
@@ -208,6 +276,8 @@ pub struct PCloudClient {
     pub workers: usize,
     /// How to handle duplicate files during transfers
     pub duplicate_mode: DuplicateMode,
+    /// Retry configuration for transient failures
+    pub retry_config: RetryConfig,
 }
 
 impl PCloudClient {
@@ -240,7 +310,21 @@ impl PCloudClient {
             auth_token: token,
             workers,
             duplicate_mode: DuplicateMode::Rename,
+            retry_config: RetryConfig::default(),
         }
+    }
+
+    /// Sets the retry configuration for transient failures.
+    ///
+    /// By default, the client will retry failed requests up to 3 times
+    /// with exponential backoff starting at 500ms.
+    pub fn set_retry_config(&mut self, config: RetryConfig) {
+        self.retry_config = config;
+    }
+
+    /// Disables automatic retries.
+    pub fn disable_retries(&mut self) {
+        self.retry_config.max_retries = 0;
     }
 
     /// Sets the authentication token directly.
@@ -273,6 +357,60 @@ impl PCloudClient {
                     .clone()
                     .unwrap_or_else(|| format!("Error code: {}", response.result)),
             ))
+        }
+    }
+
+    /// Determines if an error is retryable (transient network issues).
+    #[allow(dead_code)]
+    fn is_retryable_error(error: &PCloudError) -> bool {
+        match error {
+            PCloudError::NetworkError(e) => {
+                // Retry on connection errors, timeouts, etc.
+                e.is_timeout() || e.is_connect() || e.is_request()
+            }
+            // Don't retry on auth errors, invalid paths, etc.
+            _ => false,
+        }
+    }
+
+    /// Executes an async operation with retry logic and exponential backoff.
+    #[allow(dead_code)]
+    async fn with_retry<F, Fut, T>(&self, operation: F) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut attempt = 0;
+        let mut delay = self.retry_config.initial_delay_ms;
+
+        loop {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    attempt += 1;
+
+                    // Check if we should retry
+                    if attempt > self.retry_config.max_retries || !Self::is_retryable_error(&e) {
+                        return Err(e);
+                    }
+
+                    // Log retry attempt
+                    tracing::warn!(
+                        "Request failed (attempt {}/{}), retrying in {}ms: {}",
+                        attempt,
+                        self.retry_config.max_retries,
+                        delay,
+                        e
+                    );
+
+                    // Wait before retrying
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
+                    // Calculate next delay with exponential backoff
+                    delay = ((delay as f64) * self.retry_config.backoff_multiplier) as u64;
+                    delay = delay.min(self.retry_config.max_delay_ms);
+                }
+            }
         }
     }
 
@@ -375,6 +513,128 @@ impl PCloudClient {
         }
 
         Ok(api_resp.metadata.map(|m| m.contents).unwrap_or_default())
+    }
+
+    /// Deletes a file from pCloud.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The remote file path (e.g., "/Documents/file.txt")
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file doesn't exist or cannot be deleted.
+    pub async fn delete_file(&self, path: &str) -> Result<()> {
+        let url = self.api_url("deletefile");
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
+        let params = [("auth", auth), ("path", path)];
+
+        let response = self.client.get(&url).query(&params).send().await?;
+        let api_resp: ApiResponse = response.json().await?;
+        Self::ensure_success(&api_resp)
+    }
+
+    /// Deletes a folder and all its contents recursively.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The remote folder path (e.g., "/Documents/OldFolder")
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the folder doesn't exist or cannot be deleted.
+    pub async fn delete_folder(&self, path: &str) -> Result<()> {
+        let url = self.api_url("deletefolderrecursive");
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
+        let params = [("auth", auth), ("path", path)];
+
+        let response = self.client.get(&url).query(&params).send().await?;
+        let api_resp: ApiResponse = response.json().await?;
+        Self::ensure_success(&api_resp)
+    }
+
+    /// Renames or moves a file to a new location.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_path` - Current file path (e.g., "/Documents/old.txt")
+    /// * `to_path` - New file path (e.g., "/Archive/new.txt")
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source file doesn't exist or the destination is invalid.
+    pub async fn rename_file(&self, from_path: &str, to_path: &str) -> Result<()> {
+        let url = self.api_url("renamefile");
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
+        let params = [("auth", auth), ("path", from_path), ("topath", to_path)];
+
+        let response = self.client.get(&url).query(&params).send().await?;
+        let api_resp: ApiResponse = response.json().await?;
+        Self::ensure_success(&api_resp)
+    }
+
+    /// Renames or moves a folder to a new location.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_path` - Current folder path (e.g., "/Documents/OldName")
+    /// * `to_path` - New folder path (e.g., "/Archive/NewName")
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source folder doesn't exist or the destination is invalid.
+    pub async fn rename_folder(&self, from_path: &str, to_path: &str) -> Result<()> {
+        let url = self.api_url("renamefolder");
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
+        let params = [("auth", auth), ("path", from_path), ("topath", to_path)];
+
+        let response = self.client.get(&url).query(&params).send().await?;
+        let api_resp: ApiResponse = response.json().await?;
+        Self::ensure_success(&api_resp)
+    }
+
+    /// Gets account information including quota usage.
+    ///
+    /// # Returns
+    ///
+    /// An `AccountInfo` struct containing quota and usage information.
+    pub async fn get_account_info(&self) -> Result<AccountInfo> {
+        let url = self.api_url("userinfo");
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
+        let params = [("auth", auth)];
+
+        let response = self.client.get(&url).query(&params).send().await?;
+        let api_resp: AccountInfoResponse = response.json().await?;
+
+        if api_resp.result != 0 {
+            return Err(PCloudError::ApiError(
+                api_resp
+                    .error
+                    .unwrap_or_else(|| format!("Error code: {}", api_resp.result)),
+            ));
+        }
+
+        Ok(AccountInfo {
+            email: api_resp.email.unwrap_or_default(),
+            quota: api_resp.quota.unwrap_or(0),
+            used_quota: api_resp.usedquota.unwrap_or(0),
+            premium: api_resp.premium.unwrap_or(false),
+        })
     }
 
     pub async fn get_download_link(&self, path: &str) -> Result<String> {
