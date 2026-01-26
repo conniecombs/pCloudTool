@@ -10,7 +10,7 @@ A blazing-fast, memory-efficient Rust implementation of the pCloud file transfer
 
 ## Features
 
-✨ **New in Rust Version:**
+✨ **Core Features:**
 - 🚀 **Memory-Efficient Streaming**: Files are streamed rather than loaded into memory
 - 📁 **Recursive Folder Sync**: Upload/download entire directory trees while preserving structure
 - 🔄 **Parallel Transfers**: Concurrent file operations with configurable worker count
@@ -18,6 +18,12 @@ A blazing-fast, memory-efficient Rust implementation of the pCloud file transfer
 - 💾 **Duplicate Detection**: Skip, overwrite, or rename duplicate files
 - 🎨 **Modern GUI**: Built with Iced 0.13 for a responsive, native experience
 - ⚡ **Zero-Copy Operations**: Efficient use of Rust's ownership system
+
+🆕 **New in v0.2.0:**
+- 🔄 **Bidirectional Sync**: Compare and sync folders with optional SHA256 checksum verification
+- ⏸️ **Resume Transfers**: Save and restore transfer state for interrupted operations
+- 📊 **Per-File Progress**: Track exactly which file is being transferred in real-time
+- 🔍 **Smart Comparison**: Sync based on file size or cryptographic checksums
 
 ## Installation
 
@@ -234,6 +240,113 @@ async fn download_files(&self, tasks: Vec<(String, String)>) -> (u32, u32)
 async fn upload_folder_tree(&self, local_root: String, remote_base: String) -> Result<Vec<(String, String)>>
 async fn download_folder_tree(&self, remote_root: String, local_base: String) -> Result<Vec<(String, String)>>
 ```
+
+#### Sync Operations
+```rust
+// Sync a single folder
+async fn sync_folder(&self, local_path: &str, remote_path: &str, direction: SyncDirection, use_checksum: bool) -> Result<SyncResult>
+
+// Sync recursively through subfolders
+async fn sync_folder_recursive(&self, local_root: &str, remote_root: &str, direction: SyncDirection, use_checksum: bool) -> Result<SyncResult>
+
+// Compare folders to see what needs syncing
+async fn compare_folders(&self, local_path: &str, remote_path: &str, use_checksum: bool) -> Result<(Vec<(String, String)>, Vec<(String, String)>)>
+```
+
+#### Resume Operations
+```rust
+// Resume an interrupted upload
+async fn resume_upload(&self, state: &mut TransferState, bytes_progress: Arc<AtomicU64>, file_callback: Option<FileProgressCallback>) -> (u32, u32)
+
+// Resume an interrupted download
+async fn resume_download(&self, state: &mut TransferState, bytes_progress: Arc<AtomicU64>, file_callback: Option<FileProgressCallback>) -> (u32, u32)
+```
+
+#### Transfer State Management
+```rust
+// Save transfer state to file
+fn save_to_file(&self, path: &str) -> Result<()>
+
+// Load transfer state from file
+fn load_from_file(path: &str) -> Result<TransferState>
+```
+
+## Sync Mode
+
+The sync feature allows you to keep local and remote folders in sync:
+
+```rust
+use pcloud_rust::{PCloudClient, SyncDirection};
+
+// Bidirectional sync with checksum verification
+let result = client.sync_folder_recursive(
+    "/local/folder",
+    "/remote/folder",
+    SyncDirection::Bidirectional,
+    true,  // use SHA256 checksums
+).await?;
+
+println!("Uploaded: {}", result.uploaded);
+println!("Downloaded: {}", result.downloaded);
+println!("Skipped: {}", result.skipped);
+println!("Failed: {}", result.failed);
+```
+
+### Sync Directions
+
+| Direction | Description |
+|-----------|-------------|
+| `SyncDirection::Upload` | Only upload local files that are missing or changed on remote |
+| `SyncDirection::Download` | Only download remote files that are missing or changed locally |
+| `SyncDirection::Bidirectional` | Sync both directions |
+
+### Comparison Methods
+
+- **Size-based** (default): Fast comparison using file sizes
+- **Checksum-based** (`use_checksum: true`): SHA256 hash comparison for accuracy
+
+## Resume Interrupted Transfers
+
+Save and restore transfer state for long-running operations:
+
+```rust
+use pcloud_rust::{PCloudClient, TransferState};
+use std::sync::{Arc, atomic::AtomicU64};
+
+// During a transfer, state is automatically tracked
+let (uploaded, failed, state) = client.upload_files_with_progress(
+    tasks,
+    bytes_progress.clone(),
+    None,
+).await;
+
+// Save state if interrupted
+state.save_to_file(".transfer-state.json")?;
+
+// Later: Resume from saved state
+let mut state = TransferState::load_from_file(".transfer-state.json")?;
+let (completed, failed) = client.resume_upload(
+    &mut state,
+    bytes_progress,
+    None,
+).await;
+
+// Update saved state
+state.save_to_file(".transfer-state.json")?;
+```
+
+### TransferState Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | `String` | Unique transfer ID |
+| `direction` | `String` | "upload" or "download" |
+| `total_files` | `usize` | Total number of files |
+| `completed_files` | `Vec<String>` | Successfully transferred files |
+| `failed_files` | `Vec<String>` | Files that failed to transfer |
+| `pending_files` | `Vec<(String, String)>` | Files still to be transferred |
+| `total_bytes` | `u64` | Total bytes to transfer |
+| `transferred_bytes` | `u64` | Bytes transferred so far |
 
 ## Performance
 

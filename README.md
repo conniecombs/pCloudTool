@@ -19,6 +19,14 @@ A high-performance Rust tool for uploading and downloading files to/from pCloud 
 - **Type-safe** with compile-time error checking
 - **Duplicate detection** (skip/overwrite/rename modes)
 
+### New in v0.2.0
+
+| Feature | Description |
+|---------|-------------|
+| ![Sync](https://img.shields.io/badge/-Sync-00b894?style=flat-square) | **Bidirectional folder sync** with SHA256 checksum comparison |
+| ![Resume](https://img.shields.io/badge/-Resume-0984e3?style=flat-square) | **Resume interrupted transfers** - automatically save and restore progress |
+| ![Progress](https://img.shields.io/badge/-Progress-6c5ce7?style=flat-square) | **Per-file progress tracking** - see exactly which file is transferring |
+
 ## Quick Start
 
 ### Prerequisites
@@ -68,6 +76,15 @@ pcloud-cli list /MyFolder -u user@example.com
 
 # Create folder
 pcloud-cli create-folder /NewFolder -u user@example.com
+
+# Sync local folder with remote (bidirectional)
+pcloud-cli sync ./local-folder -d /remote-folder --direction both
+
+# Sync with checksum verification (slower but more accurate)
+pcloud-cli sync ./local-folder -d /remote-folder --checksum --recursive
+
+# Resume an interrupted transfer
+pcloud-cli resume .transfer-state.json
 ```
 
 ### Environment Variables
@@ -107,7 +124,9 @@ pcloud-cli upload file.txt --duplicate-mode skip -d /MyFolder
 - Upload files or entire folders
 - Download files or complete directory trees
 - Browse your pCloud storage
-- Real-time transfer status
+- **Per-file progress tracking** with current filename display
+- Real-time transfer status with speed metrics
+- Adjustable concurrency (1-20 parallel workers)
 
 ### Screenshots
 
@@ -134,7 +153,7 @@ pcloud-cli upload file.txt --duplicate-mode skip -d /MyFolder
 ## API Usage
 
 ```rust
-use pcloud_rust::{PCloudClient, Region, DuplicateMode};
+use pcloud_rust::{PCloudClient, Region, DuplicateMode, SyncDirection};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -165,8 +184,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (downloaded, failed) = client.download_files(tasks).await;
     println!("Downloaded: {}, Failed: {}", downloaded, failed);
 
+    // Sync folders bidirectionally with checksum verification
+    let result = client.sync_folder_recursive(
+        "/local/folder",
+        "/remote/folder",
+        SyncDirection::Bidirectional,
+        true,  // use_checksum
+    ).await?;
+
+    println!("Sync complete: {} uploaded, {} downloaded, {} skipped",
+        result.uploaded, result.downloaded, result.skipped);
+
     Ok(())
 }
+```
+
+### Resume Interrupted Transfers
+
+```rust
+use pcloud_rust::{PCloudClient, TransferState};
+use std::sync::{Arc, atomic::AtomicU64};
+
+// Load saved transfer state
+let mut state = TransferState::load_from_file(".transfer-state.json")?;
+
+// Resume the transfer
+let bytes_progress = Arc::new(AtomicU64::new(0));
+let (completed, failed) = client.resume_upload(&mut state, bytes_progress, None).await;
+
+// Save updated state (in case of another interruption)
+state.save_to_file(".transfer-state.json")?;
 ```
 
 ## Performance
@@ -191,6 +238,13 @@ pcloud-cli download <files/folders...> --recursive -d <remote-path> -o <local-pa
 pcloud-cli list <path> -u <email>
 pcloud-cli create-folder <path> -u <email>
 
+# Sync operations
+pcloud-cli sync <local-path> -d <remote-path> --direction <upload|download|both>
+pcloud-cli sync ./folder -d /Backup --checksum --recursive
+
+# Resume interrupted transfers
+pcloud-cli resume <state-file.json>
+
 # Options
 -u, --username <EMAIL>       # pCloud email
 -p, --password <PASSWORD>    # pCloud password
@@ -200,7 +254,9 @@ pcloud-cli create-folder <path> -u <email>
 -d, --remote-path <PATH>     # Remote folder
 -o, --local-path <PATH>      # Local destination
 --duplicate-mode <MODE>      # skip|overwrite|rename
---recursive                  # Download folders recursively
+--recursive                  # Download/sync folders recursively
+--direction <DIR>            # Sync direction: upload|download|both
+--checksum                   # Use SHA256 checksums for sync comparison
 ```
 
 ## Documentation

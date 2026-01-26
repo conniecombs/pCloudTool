@@ -42,7 +42,6 @@ enum SortOrder {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct TransferProgress {
     total_files: usize,
     finished_files: usize,
@@ -50,6 +49,9 @@ struct TransferProgress {
     transferred_bytes: u64,
     start_time: Instant,
     current_speed: f64,
+    current_file: Option<String>,
+    current_file_size: u64,
+    current_file_progress: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +144,14 @@ impl Recipe for TransferRecipe {
                                 let tx_inner = tx_clone.clone();
                                 async move {
                                     let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+                                    let filename = local.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+
+                                    // Notify file start
+                                    let _ = tx_inner.send(Message::TransferFileStarted(filename, size));
+
                                     let result = c
                                         .upload_file_with_progress(
                                             local.to_str().unwrap_or_default(),
@@ -170,12 +180,18 @@ impl Recipe for TransferRecipe {
                                 yield Message::TransferBytesProgress(bytes);
                             }
                             msg = rx.recv() => {
-                                if let Some(Message::TransferItemFinished(size, ok)) = msg {
-                                    files_done += 1;
-                                    yield Message::TransferItemFinished(size, ok);
-                                    if files_done >= t_files {
-                                        break;
+                                match msg {
+                                    Some(Message::TransferFileStarted(name, size)) => {
+                                        yield Message::TransferFileStarted(name, size);
                                     }
+                                    Some(Message::TransferItemFinished(size, ok)) => {
+                                        files_done += 1;
+                                        yield Message::TransferItemFinished(size, ok);
+                                        if files_done >= t_files {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -204,6 +220,11 @@ impl Recipe for TransferRecipe {
                                 let bp = bytes_progress_clone.clone();
                                 let tx_inner = tx_clone.clone();
                                 async move {
+                                    let filename = remote.split('/').next_back().unwrap_or("unknown").to_string();
+
+                                    // Notify file start (size unknown for downloads until complete)
+                                    let _ = tx_inner.send(Message::TransferFileStarted(filename, 0));
+
                                     let result = c.download_file(&remote, &local).await;
                                     let size = if result.is_ok() {
                                         let s = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
@@ -231,12 +252,18 @@ impl Recipe for TransferRecipe {
                                 yield Message::TransferBytesProgress(bytes);
                             }
                             msg = rx.recv() => {
-                                if let Some(Message::TransferItemFinished(size, ok)) = msg {
-                                    files_done += 1;
-                                    yield Message::TransferItemFinished(size, ok);
-                                    if files_done >= t_files {
-                                        break;
+                                match msg {
+                                    Some(Message::TransferFileStarted(name, size)) => {
+                                        yield Message::TransferFileStarted(name, size);
                                     }
+                                    Some(Message::TransferItemFinished(size, ok)) => {
+                                        files_done += 1;
+                                        yield Message::TransferItemFinished(size, ok);
+                                        if files_done >= t_files {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -284,7 +311,7 @@ enum Message {
     StageTransfer(TransferType),
     TransferStarted(usize, u64),
     TransferBytesProgress(u64),
-    #[allow(dead_code)]
+    TransferFileStarted(String, u64),
     TransferItemFinished(u64, bool),
     TransferCompleted,
     OperationFailed(String),
@@ -697,7 +724,18 @@ impl PCloudGui {
                     transferred_bytes: 0,
                     start_time: Instant::now(),
                     current_speed: 0.0,
+                    current_file: None,
+                    current_file_size: 0,
+                    current_file_progress: 0,
                 });
+                Task::none()
+            }
+            Message::TransferFileStarted(filename, size) => {
+                if let Status::Transferring(p) = &mut self.status {
+                    p.current_file = Some(filename);
+                    p.current_file_size = size;
+                    p.current_file_progress = 0;
+                }
                 Task::none()
             }
             Message::TransferBytesProgress(bytes) => {
@@ -1116,21 +1154,46 @@ impl PCloudGui {
                 } else {
                     0.0
                 };
+
+                // Truncate filename if too long
+                let current_file_display = p.current_file.as_ref().map(|f| {
+                    if f.len() > 25 {
+                        format!("{}...", &f[..22])
+                    } else {
+                        f.clone()
+                    }
+                }).unwrap_or_default();
+
                 row![
-                    progress_bar(0.0..=100.0, pct)
-                        .height(10)
-                        .width(Length::Fixed(200.0))
-                        .style(style_bar),
-                    Space::with_width(10),
-                    text(format!(
-                        "{}/{} files • {} / {} • {:.1} MB/s",
-                        p.finished_files,
-                        p.total_files,
-                        format_bytes(p.transferred_bytes),
-                        format_bytes(p.total_bytes),
-                        p.current_speed / 1_000_000.0
-                    ))
-                    .size(12)
+                    column![
+                        row![
+                            progress_bar(0.0..=100.0, pct)
+                                .height(8)
+                                .width(Length::Fixed(200.0))
+                                .style(style_bar),
+                            Space::with_width(10),
+                            text(format!(
+                                "{}/{} files • {:.1}%",
+                                p.finished_files,
+                                p.total_files,
+                                pct
+                            ))
+                            .size(11)
+                        ]
+                        .align_y(Alignment::Center),
+                        row![
+                            text(format!(
+                                "📄 {} • {} / {} • {:.1} MB/s",
+                                current_file_display,
+                                format_bytes(p.transferred_bytes),
+                                format_bytes(p.total_bytes),
+                                p.current_speed / 1_000_000.0
+                            ))
+                            .size(10)
+                            .color(Color::from_rgb(0.6, 0.6, 0.6))
+                        ]
+                    ]
+                    .spacing(2)
                 ]
                 .align_y(Alignment::Center)
             }
