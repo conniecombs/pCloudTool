@@ -1,6 +1,12 @@
 # pCloud Fast Transfer
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](#)
+
 A high-performance Rust tool for uploading and downloading files to/from pCloud with parallel transfer support, recursive folder sync, and modern GUI and CLI interfaces.
+
+![pCloud Fast Transfer Banner](https://via.placeholder.com/800x200/1a1a2e/16213e?text=pCloud+Fast+Transfer)
 
 ## Features
 
@@ -102,6 +108,28 @@ pcloud-cli upload file.txt --duplicate-mode skip -d /MyFolder
 - Download files or complete directory trees
 - Browse your pCloud storage
 - Real-time transfer status
+
+### Screenshots
+
+<p align="center">
+  <img src="https://via.placeholder.com/400x300/2d3436/74b9ff?text=Login+Screen" alt="Login Screen" width="400"/>
+  <br/>
+  <em>Secure authentication with region selection</em>
+</p>
+
+<p align="center">
+  <img src="https://via.placeholder.com/400x300/2d3436/00b894?text=Upload+Tab" alt="Upload Interface" width="400"/>
+  <img src="https://via.placeholder.com/400x300/2d3436/fdcb6e?text=Download+Tab" alt="Download Interface" width="400"/>
+  <br/>
+  <em>Upload and Download interfaces with real-time progress</em>
+</p>
+
+<p align="center">
+  <img src="https://via.placeholder.com/400x300/2d3436/a29bfe?text=Browse+Files" alt="File Browser" width="400"/>
+  <img src="https://via.placeholder.com/400x300/2d3436/ff7675?text=Transfer+Progress" alt="Transfer Progress" width="400"/>
+  <br/>
+  <em>File browser and transfer progress with speed metrics</em>
+</p>
 
 ## API Usage
 

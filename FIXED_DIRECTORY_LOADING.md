@@ -1,4 +1,8 @@
-# ✅ Directory Loading Issue - FIXED!
+# Directory Loading Issue - FIXED!
+
+[![Status](https://img.shields.io/badge/Status-Resolved-brightgreen.svg)](#)
+[![Issue](https://img.shields.io/badge/Issue-JSON%20Parsing-red.svg)](#)
+[![Fix](https://img.shields.io/badge/Fix-serde%20flatten-blue.svg)](#)
 
 ## Problems Identified & Fixed
 

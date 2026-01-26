@@ -1,5 +1,10 @@
 # Debugging Directory Loading Issues
 
+[![Troubleshooting](https://img.shields.io/badge/Type-Troubleshooting-yellow.svg)](#)
+[![Status](https://img.shields.io/badge/Status-Reference-blue.svg)](#)
+
+> **Note:** Most directory loading issues have been resolved. See [FIXED_DIRECTORY_LOADING.md](FIXED_DIRECTORY_LOADING.md) for the solution.
+
 If the program is failing to load remote pCloud directories, follow these steps to diagnose and fix the issue.
 
 ## Quick Diagnosis

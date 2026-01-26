@@ -1,6 +1,12 @@
 # pCloud Rust - High-Performance pCloud Client
 
+[![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
+[![tokio](https://img.shields.io/badge/async-tokio-blue.svg)](https://tokio.rs/)
+[![iced](https://img.shields.io/badge/GUI-iced-purple.svg)](https://github.com/iced-rs/iced)
+
 A blazing-fast, memory-efficient Rust implementation of the pCloud file transfer tool with recursive folder upload/download support and a modern GUI.
+
+![Architecture Overview](https://via.placeholder.com/700x150/0d1117/58a6ff?text=Rust+%E2%86%92+Tokio+Async+%E2%86%92+pCloud+API)
 
 ## Features
 
