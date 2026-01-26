@@ -57,11 +57,25 @@ The main window features a modern tabbed interface with three main sections:
 </p>
 
 - Real-time transfer progress bar
-- Current file indicator
+- **Per-file progress tracking** with current filename display
 - Live speed metrics (MB/s)
-- Files completed counter
-- Estimated time remaining (ETA)
+- Files completed counter (e.g., "5/20 files")
+- Percentage complete indicator
 - Cancel button for stopping transfers
+
+### New: Per-File Progress
+
+The transfer dialog now shows exactly which file is being transferred:
+
+<p align="center">
+  <img src="https://via.placeholder.com/600x100/2d3436/00b894?text=📄+document.pdf+•+45%25+•+12.5+MB/s" alt="Per-File Progress" width="600"/>
+</p>
+
+Features:
+- Current filename display (truncated if too long)
+- Individual file progress percentage
+- Overall transfer progress
+- Real-time speed metrics
 
 ## Settings Panel
 

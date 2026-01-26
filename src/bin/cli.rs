@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
-use pcloud_rust::{DuplicateMode, PCloudClient, Region};
+use pcloud_rust::{DuplicateMode, PCloudClient, Region, SyncDirection, TransferState};
 use std::path::Path;
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -124,6 +126,34 @@ enum Commands {
 
     /// Show account status and quota information
     Status,
+
+    /// Sync a local folder with a remote folder
+    Sync {
+        /// Local folder path
+        local_path: String,
+
+        /// Remote folder path
+        #[arg(short = 'd', long, default_value = "/")]
+        remote_path: String,
+
+        /// Sync direction: upload, download, or both
+        #[arg(long, default_value = "both")]
+        direction: String,
+
+        /// Use checksums for comparison (slower but more accurate)
+        #[arg(long)]
+        checksum: bool,
+
+        /// Sync recursively through subfolders
+        #[arg(short, long)]
+        recursive: bool,
+    },
+
+    /// Resume an interrupted transfer
+    Resume {
+        /// Path to the transfer state file (.transfer-state.json)
+        state_file: String,
+    },
 }
 
 fn parse_region(region_str: &str) -> Region {
@@ -138,6 +168,14 @@ fn parse_duplicate_mode(mode_str: &str) -> DuplicateMode {
         "skip" => DuplicateMode::Skip,
         "overwrite" => DuplicateMode::Overwrite,
         _ => DuplicateMode::Rename,
+    }
+}
+
+fn parse_sync_direction(direction_str: &str) -> SyncDirection {
+    match direction_str.to_lowercase().as_str() {
+        "upload" => SyncDirection::Upload,
+        "download" => SyncDirection::Download,
+        _ => SyncDirection::Bidirectional,
     }
 }
 
@@ -526,6 +564,153 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("✗ Error getting account info: {}", e);
                     process::exit(1);
                 }
+            }
+        }
+
+        Commands::Sync {
+            local_path,
+            remote_path,
+            direction,
+            checksum,
+            recursive,
+        } => {
+            let client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
+
+            let sync_direction = parse_sync_direction(&direction);
+
+            // Validate local path exists
+            if !Path::new(&local_path).exists() {
+                eprintln!("✗ Local path does not exist: {}", local_path);
+                process::exit(1);
+            }
+
+            let direction_str = match sync_direction {
+                SyncDirection::Upload => "upload only",
+                SyncDirection::Download => "download only",
+                SyncDirection::Bidirectional => "bidirectional",
+            };
+
+            println!("\n🔄 Syncing folders...");
+            println!("   Local:     {}", local_path);
+            println!("   Remote:    {}", remote_path);
+            println!("   Direction: {}", direction_str);
+            println!("   Checksum:  {}", if checksum { "enabled" } else { "disabled (size comparison)" });
+            println!("   Recursive: {}", if recursive { "yes" } else { "no" });
+            println!();
+
+            let result = if recursive {
+                client
+                    .sync_folder_recursive(&local_path, &remote_path, sync_direction, checksum)
+                    .await
+            } else {
+                client
+                    .sync_folder(&local_path, &remote_path, sync_direction, checksum)
+                    .await
+            };
+
+            match result {
+                Ok(sync_result) => {
+                    println!("\n✓ Sync complete!");
+                    println!("  Uploaded:   {} files", sync_result.uploaded);
+                    println!("  Downloaded: {} files", sync_result.downloaded);
+                    println!("  Skipped:    {} files", sync_result.skipped);
+                    if sync_result.failed > 0 {
+                        println!("  Failed:     {} files", sync_result.failed);
+                    }
+                    println!();
+
+                    if sync_result.failed > 0 {
+                        process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("✗ Sync failed: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        Commands::Resume { state_file } => {
+            // Load transfer state
+            let mut state = match TransferState::load_from_file(&state_file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("✗ Failed to load transfer state: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            println!("\n🔄 Resuming transfer...");
+            println!("   Transfer ID: {}", state.id);
+            println!("   Direction:   {}", state.direction);
+            println!("   Completed:   {}/{} files", state.completed_files.len(), state.total_files);
+            println!("   Pending:     {} files", state.pending_files.len());
+            println!("   Failed:      {} files", state.failed_files.len());
+            println!();
+
+            if state.pending_files.is_empty() {
+                println!("✓ Transfer already complete!");
+                return Ok(());
+            }
+
+            let client =
+                authenticate_client(cli.username, cli.password, cli.token, region, cli.workers)
+                    .await?;
+
+            let bytes_progress = Arc::new(AtomicU64::new(0));
+            let bp_clone = bytes_progress.clone();
+
+            // Progress display task
+            let progress_handle = tokio::spawn(async move {
+                let mut last_bytes = 0u64;
+                let start = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let current = bp_clone.load(Ordering::Relaxed);
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        current as f64 / elapsed / 1_000_000.0
+                    } else {
+                        0.0
+                    };
+                    if current != last_bytes {
+                        print!("\r  Progress: {} ({:.2} MB/s)     ",
+                            format_size(current), speed);
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        last_bytes = current;
+                    }
+                }
+            });
+
+            let (completed, failed) = if state.direction == "upload" {
+                client.resume_upload(&mut state, bytes_progress.clone(), None).await
+            } else {
+                client.resume_download(&mut state, bytes_progress.clone(), None).await
+            };
+
+            progress_handle.abort();
+            println!();
+
+            // Save updated state
+            if let Err(e) = state.save_to_file(&state_file) {
+                eprintln!("Warning: Could not save transfer state: {}", e);
+            }
+
+            println!("\n✓ Resume complete!");
+            println!("  Completed: {} files", completed);
+            if failed > 0 {
+                println!("  Failed:    {} files", failed);
+            }
+            println!();
+
+            if !state.pending_files.is_empty() {
+                println!("Note: {} files still pending. Run resume again to continue.", state.pending_files.len());
+            }
+
+            if failed > 0 {
+                process::exit(1);
             }
         }
     }
