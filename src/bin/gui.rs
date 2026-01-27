@@ -175,6 +175,7 @@ impl Recipe for TransferRecipe {
 
                     loop {
                         tokio::select! {
+                            biased;  // Prioritize interval for consistent progress updates
                             _ = interval.tick() => {
                                 let bytes = bytes_progress.load(Ordering::Relaxed);
                                 yield Message::TransferBytesProgress(bytes);
@@ -186,6 +187,9 @@ impl Recipe for TransferRecipe {
                                     }
                                     Some(Message::TransferItemFinished(size, ok)) => {
                                         files_done += 1;
+                                        // Emit progress update with file completion
+                                        let bytes = bytes_progress.load(Ordering::Relaxed);
+                                        yield Message::TransferBytesProgress(bytes);
                                         yield Message::TransferItemFinished(size, ok);
                                         if files_done >= t_files {
                                             break;
@@ -198,6 +202,9 @@ impl Recipe for TransferRecipe {
                     }
 
                     let _ = transfer_handle.await;
+                    // Final progress update before completion
+                    let final_bytes = bytes_progress.load(Ordering::Relaxed);
+                    yield Message::TransferBytesProgress(final_bytes);
                     yield Message::TransferCompleted;
                 };
 
@@ -247,6 +254,7 @@ impl Recipe for TransferRecipe {
 
                     loop {
                         tokio::select! {
+                            biased;  // Prioritize interval for consistent progress updates
                             _ = interval.tick() => {
                                 let bytes = bytes_progress.load(Ordering::Relaxed);
                                 yield Message::TransferBytesProgress(bytes);
@@ -258,6 +266,9 @@ impl Recipe for TransferRecipe {
                                     }
                                     Some(Message::TransferItemFinished(size, ok)) => {
                                         files_done += 1;
+                                        // Emit progress update with file completion
+                                        let bytes = bytes_progress.load(Ordering::Relaxed);
+                                        yield Message::TransferBytesProgress(bytes);
                                         yield Message::TransferItemFinished(size, ok);
                                         if files_done >= t_files {
                                             break;
@@ -270,6 +281,9 @@ impl Recipe for TransferRecipe {
                     }
 
                     let _ = transfer_handle.await;
+                    // Final progress update before completion
+                    let final_bytes = bytes_progress.load(Ordering::Relaxed);
+                    yield Message::TransferBytesProgress(final_bytes);
                     yield Message::TransferCompleted;
                 };
 
@@ -1216,15 +1230,21 @@ fn gen_id() -> u64 {
         .as_nanos() as u64
 }
 fn format_bytes(b: u64) -> String {
+    if b == 0 {
+        return "0 B".to_string();
+    }
     if b < 1024 {
         return format!("{} B", b);
     }
-    let e = (b as f64).ln() / 1024f64.ln();
-    format!(
-        "{:.1} {}B",
-        b as f64 / 1024f64.powf(e),
-        "KMGTPE".chars().nth(e as usize - 1).unwrap_or('?')
-    )
+
+    const UNITS: &[&str] = &["KB", "MB", "GB", "TB", "PB", "EB"];
+    let exp = ((b as f64).ln() / 1024f64.ln()).floor() as usize;
+    let exp = exp.min(UNITS.len()); // Clamp to available units
+    let unit_index = exp.saturating_sub(1);
+    let divisor = 1024u64.pow(exp as u32) as f64;
+    let value = b as f64 / divisor;
+
+    format!("{:.1} {}", value, UNITS[unit_index])
 }
 fn style_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     text_input::Style {
