@@ -1,9 +1,10 @@
 use iced::advanced::subscription::{self, Event, Hasher, Recipe};
 use iced::futures::stream::{self, BoxStream, StreamExt};
+use iced::keyboard::{self, Key, Modifiers};
 use iced::time::Instant;
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, progress_bar, row, scrollable,
-    slider, text, text_input, vertical_rule, Space,
+    button, column, container, horizontal_rule, horizontal_space, mouse_area, opaque,
+    progress_bar, row, scrollable, slider, stack, text, text_input, vertical_rule, Space,
 };
 use iced::{alignment, Alignment, Background, Color, Element, Length, Subscription, Task, Theme};
 
@@ -12,6 +13,16 @@ use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Context menu state for right-click operations
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    item: Option<FileItem>,
+}
+
+/// Double-click detection
+const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 
 pub fn main() -> iced::Result {
     iced::application("pCloud Fast Transfer", PCloudGui::update, PCloudGui::view)
@@ -82,6 +93,11 @@ struct PCloudGui {
     sort_by: SortBy,
     sort_order: SortOrder,
     search_filter: String,
+    // Usability improvements
+    context_menu: Option<ContextMenu>,
+    last_click_time: Option<std::time::Instant>,
+    last_clicked_item: Option<String>,
+    create_folder_state: CreateFolderState,
 }
 
 #[derive(Debug, Clone)]
@@ -309,7 +325,7 @@ enum Message {
     SortByChanged(SortBy),
     SearchFilterChanged(String),
     ClearSearchFilter,
-    SelectItem(FileItem),
+    ItemClicked(FileItem), // For single-click selection and double-click navigation
     ConcurrencyChanged(f64),
     UploadFilePressed,
     UploadFolderPressed,
@@ -329,6 +345,28 @@ enum Message {
     TransferItemFinished(u64, bool),
     TransferCompleted,
     OperationFailed(String),
+    // Context menu messages
+    ShowContextMenu(Option<FileItem>),
+    HideContextMenu,
+    ContextMenuOpen,
+    ContextMenuDownload,
+    ContextMenuDelete,
+    ContextMenuNewFolder,
+    // Keyboard shortcut messages
+    KeyboardEvent(Key, Modifiers),
+    // Create folder
+    CreateFolderPressed,
+    CreateFolderNameChanged(String),
+    CreateFolderConfirmed,
+    CreateFolderResult(Result<(), String>),
+    CancelCreateFolder,
+}
+
+/// State for creating a new folder
+#[derive(Debug, Clone, Default)]
+struct CreateFolderState {
+    active: bool,
+    name: String,
 }
 
 impl PCloudGui {
@@ -351,6 +389,10 @@ impl PCloudGui {
                 sort_by: SortBy::default(),
                 sort_order: SortOrder::default(),
                 search_filter: String::new(),
+                context_menu: None,
+                last_click_time: None,
+                last_clicked_item: None,
+                create_folder_state: CreateFolderState::default(),
             },
             Task::none(),
         )
@@ -365,7 +407,11 @@ impl PCloudGui {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        if let Some(transfer_type) = &self.active_transfer {
+        let keyboard_sub = keyboard::on_key_press(|key, modifiers| {
+            Some(Message::KeyboardEvent(key, modifiers))
+        });
+
+        let transfer_sub = if let Some(transfer_type) = &self.active_transfer {
             match transfer_type {
                 TransferType::Upload(id, tasks, bytes) => {
                     subscription::from_recipe(TransferRecipe {
@@ -392,7 +438,9 @@ impl PCloudGui {
             }
         } else {
             Subscription::none()
-        }
+        };
+
+        Subscription::batch([keyboard_sub, transfer_sub])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -509,10 +557,6 @@ impl PCloudGui {
             }
             Message::ClearSearchFilter => {
                 self.search_filter.clear();
-                Task::none()
-            }
-            Message::SelectItem(item) => {
-                self.selected_item = Some(item);
                 Task::none()
             }
             Message::UploadFilePressed => {
@@ -778,6 +822,236 @@ impl PCloudGui {
                 self.status = Status::Error(s);
                 Task::none()
             }
+            // Item clicked - handles single/double click detection
+            Message::ItemClicked(item) => {
+                let now = std::time::Instant::now();
+                let is_double_click = self
+                    .last_click_time
+                    .map(|t| now.duration_since(t) < DOUBLE_CLICK_THRESHOLD)
+                    .unwrap_or(false)
+                    && self
+                        .last_clicked_item
+                        .as_ref()
+                        .map(|n| n == &item.name)
+                        .unwrap_or(false);
+
+                self.last_click_time = Some(now);
+                self.last_clicked_item = Some(item.name.clone());
+
+                if is_double_click && item.isfolder {
+                    // Double-click on folder: navigate into it
+                    self.update(Message::NavigateTo(item.name))
+                } else {
+                    // Single click: select item (works for both files and folders)
+                    self.selected_item = Some(item);
+                    Task::none()
+                }
+            }
+            // Context menu messages
+            Message::ShowContextMenu(item) => {
+                // Also select the item when showing context menu
+                if let Some(ref i) = item {
+                    self.selected_item = Some(i.clone());
+                }
+                self.context_menu = Some(ContextMenu { item });
+                Task::none()
+            }
+            Message::HideContextMenu => {
+                self.context_menu = None;
+                Task::none()
+            }
+            Message::ContextMenuOpen => {
+                self.context_menu = None;
+                if let Some(item) = &self.selected_item {
+                    if item.isfolder {
+                        return self.update(Message::NavigateTo(item.name.clone()));
+                    }
+                }
+                Task::none()
+            }
+            Message::ContextMenuDownload => {
+                self.context_menu = None;
+                self.update(Message::DownloadPressed)
+            }
+            Message::ContextMenuDelete => {
+                self.context_menu = None;
+                self.update(Message::DeletePressed)
+            }
+            Message::ContextMenuNewFolder => {
+                self.context_menu = None;
+                self.update(Message::CreateFolderPressed)
+            }
+            // Keyboard shortcuts
+            Message::KeyboardEvent(key, modifiers) => {
+                // Don't process shortcuts during transfers or when typing in inputs
+                if self.state != AppState::Dashboard {
+                    return Task::none();
+                }
+                // Don't process if creating folder (typing)
+                if self.create_folder_state.active {
+                    if matches!(key, Key::Named(keyboard::key::Named::Escape)) {
+                        return self.update(Message::CancelCreateFolder);
+                    }
+                    if matches!(key, Key::Named(keyboard::key::Named::Enter)) {
+                        return self.update(Message::CreateFolderConfirmed);
+                    }
+                    return Task::none();
+                }
+
+                match key {
+                    // Ctrl+R or F5: Refresh
+                    Key::Character(c) if c.as_str() == "r" && modifiers.control() => {
+                        self.update(Message::RefreshList)
+                    }
+                    Key::Named(keyboard::key::Named::F5) => self.update(Message::RefreshList),
+
+                    // Ctrl+U: Upload files
+                    Key::Character(c) if c.as_str() == "u" && modifiers.control() => {
+                        if !self.is_busy() {
+                            self.update(Message::UploadFilePressed)
+                        } else {
+                            Task::none()
+                        }
+                    }
+
+                    // Ctrl+Shift+U: Upload folder
+                    Key::Character(c)
+                        if c.as_str() == "U" && modifiers.control() && modifiers.shift() =>
+                    {
+                        if !self.is_busy() {
+                            self.update(Message::UploadFolderPressed)
+                        } else {
+                            Task::none()
+                        }
+                    }
+
+                    // Ctrl+D: Download selected
+                    Key::Character(c) if c.as_str() == "d" && modifiers.control() => {
+                        if !self.is_busy() && self.selected_item.is_some() {
+                            self.update(Message::DownloadPressed)
+                        } else {
+                            Task::none()
+                        }
+                    }
+
+                    // Delete or Backspace: Delete selected (with confirmation)
+                    Key::Named(keyboard::key::Named::Delete) => {
+                        if !self.is_busy() && self.selected_item.is_some() {
+                            let is_confirming =
+                                matches!(&self.status, Status::Error(s) if s.contains("Delete"));
+                            if is_confirming {
+                                self.update(Message::DeleteConfirmed)
+                            } else {
+                                self.update(Message::DeletePressed)
+                            }
+                        } else {
+                            Task::none()
+                        }
+                    }
+
+                    // Enter: Open folder / start transfer if staged
+                    Key::Named(keyboard::key::Named::Enter) => {
+                        if matches!(self.status, Status::ReadyToUpload(_, _)) {
+                            self.update(Message::StartTransferPressed)
+                        } else if let Some(item) = &self.selected_item {
+                            if item.isfolder {
+                                let name = item.name.clone();
+                                self.update(Message::NavigateTo(name))
+                            } else {
+                                Task::none()
+                            }
+                        } else {
+                            Task::none()
+                        }
+                    }
+
+                    // Backspace: Go up one directory
+                    Key::Named(keyboard::key::Named::Backspace) => {
+                        if !self.is_busy() {
+                            self.update(Message::NavigateUp)
+                        } else {
+                            Task::none()
+                        }
+                    }
+
+                    // Escape: Cancel staged transfer / clear selection / close context menu
+                    Key::Named(keyboard::key::Named::Escape) => {
+                        if self.context_menu.is_some() {
+                            self.context_menu = None;
+                            Task::none()
+                        } else if self.staged_transfer.is_some() {
+                            self.update(Message::CancelTransferPressed)
+                        } else {
+                            self.selected_item = None;
+                            Task::none()
+                        }
+                    }
+
+                    // Ctrl+N: New folder
+                    Key::Character(c) if c.as_str() == "n" && modifiers.control() => {
+                        if !self.is_busy() {
+                            self.update(Message::CreateFolderPressed)
+                        } else {
+                            Task::none()
+                        }
+                    }
+
+                    // Home: Go to root
+                    Key::Named(keyboard::key::Named::Home) if modifiers.control() => {
+                        self.update(Message::NavigateToPath("/".to_string()))
+                    }
+
+                    _ => Task::none(),
+                }
+            }
+            // Create folder messages
+            Message::CreateFolderPressed => {
+                self.create_folder_state = CreateFolderState {
+                    active: true,
+                    name: String::new(),
+                };
+                Task::none()
+            }
+            Message::CreateFolderNameChanged(name) => {
+                self.create_folder_state.name = name;
+                Task::none()
+            }
+            Message::CreateFolderConfirmed => {
+                let name = self.create_folder_state.name.trim().to_string();
+                if name.is_empty() {
+                    self.status = Status::Error("Folder name cannot be empty".into());
+                    return Task::none();
+                }
+                self.create_folder_state.active = false;
+                self.status = Status::Working("Creating folder...".into());
+                let client = self.client.clone();
+                let path = if self.current_path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", self.current_path, name)
+                };
+                Task::perform(
+                    async move { client.create_folder(&path).await.map_err(|e| e.to_string()) },
+                    Message::CreateFolderResult,
+                )
+            }
+            Message::CreateFolderResult(result) => {
+                self.create_folder_state = CreateFolderState::default();
+                match result {
+                    Ok(_) => {
+                        self.status = Status::Success("Folder created".into());
+                        self.update(Message::RefreshList)
+                    }
+                    Err(e) => {
+                        self.status = Status::Error(format!("Failed to create folder: {}", e));
+                        Task::none()
+                    }
+                }
+            }
+            Message::CancelCreateFolder => {
+                self.create_folder_state = CreateFolderState::default();
+                Task::none()
+            }
         }
     }
 
@@ -788,14 +1062,185 @@ impl PCloudGui {
         let sidebar = self.view_sidebar();
         let content = self.view_file_list();
         let status = self.view_status_bar();
-        column![
+
+        // Base layout
+        let base = column![
             self.view_header(),
             horizontal_rule(1),
             row![sidebar, vertical_rule(1), content].height(Length::Fill),
             horizontal_rule(1),
             status
-        ]
+        ];
+
+        // Overlay with context menu if active, or create folder dialog
+        if self.create_folder_state.active {
+            let dialog = self.view_create_folder_dialog();
+            stack![
+                base,
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_| container::Style {
+                            background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.5).into()),
+                            ..Default::default()
+                        })
+                )
+                .on_press(Message::CancelCreateFolder),
+                container(opaque(dialog))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+            ]
+            .into()
+        } else if let Some(menu) = &self.context_menu {
+            let menu_widget = self.view_context_menu(menu);
+            stack![
+                base,
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_| container::Style {
+                            background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.3).into()),
+                            ..Default::default()
+                        })
+                )
+                .on_press(Message::HideContextMenu),
+                container(opaque(menu_widget))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+            ]
+            .into()
+        } else {
+            base.into()
+        }
+    }
+
+    fn view_create_folder_dialog(&self) -> Element<'_, Message> {
+        container(
+            column![
+                text("Create New Folder").size(16),
+                Space::with_height(15),
+                text_input("Folder name", &self.create_folder_state.name)
+                    .on_input(Message::CreateFolderNameChanged)
+                    .on_submit(Message::CreateFolderConfirmed)
+                    .padding(10)
+                    .style(style_input),
+                Space::with_height(15),
+                row![
+                    button(text("Cancel").align_x(alignment::Horizontal::Center))
+                        .padding([8, 20])
+                        .style(style_secondary)
+                        .on_press(Message::CancelCreateFolder),
+                    Space::with_width(10),
+                    button(text("Create").align_x(alignment::Horizontal::Center))
+                        .padding([8, 20])
+                        .style(style_primary)
+                        .on_press(Message::CreateFolderConfirmed),
+                ]
+            ]
+            .padding(20)
+            .width(300),
+        )
+        .style(|_| container::Style {
+            background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
+            border: iced::Border {
+                color: Color::from_rgb(0.3, 0.3, 0.3),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
         .into()
+    }
+
+    fn view_context_menu(&self, menu: &ContextMenu) -> Element<'_, Message> {
+        let mut menu_items: Vec<Element<'_, Message>> = Vec::new();
+
+        // Show item name if selected
+        if let Some(item) = &menu.item {
+            let icon = if item.isfolder { "📁" } else { "📄" };
+            let name = if item.name.len() > 25 {
+                format!("{}...", &item.name[..22])
+            } else {
+                item.name.clone()
+            };
+            menu_items.push(
+                text(format!("{} {}", icon, name))
+                    .size(12)
+                    .color(Color::from_rgb(0.7, 0.7, 0.7))
+                    .into(),
+            );
+            menu_items.push(Space::with_height(8).into());
+
+            if item.isfolder {
+                menu_items.push(
+                    button(text("📂 Open Folder").size(12))
+                        .width(Length::Fill)
+                        .padding([8, 15])
+                        .style(style_context_menu_item)
+                        .on_press(Message::ContextMenuOpen)
+                        .into(),
+                );
+            }
+            menu_items.push(
+                button(text("⬇️ Download").size(12))
+                    .width(Length::Fill)
+                    .padding([8, 15])
+                    .style(style_context_menu_item)
+                    .on_press(Message::ContextMenuDownload)
+                    .into(),
+            );
+            menu_items.push(
+                button(text("🗑️ Delete").size(12))
+                    .width(Length::Fill)
+                    .padding([8, 15])
+                    .style(style_context_menu_item)
+                    .on_press(Message::ContextMenuDelete)
+                    .into(),
+            );
+            menu_items.push(horizontal_rule(1).into());
+        }
+
+        menu_items.push(
+            button(text("📁 New Folder").size(12))
+                .width(Length::Fill)
+                .padding([8, 15])
+                .style(style_context_menu_item)
+                .on_press(Message::ContextMenuNewFolder)
+                .into(),
+        );
+
+        menu_items.push(Space::with_height(8).into());
+        menu_items.push(
+            button(text("Cancel").size(12).align_x(alignment::Horizontal::Center))
+                .width(Length::Fill)
+                .padding([8, 15])
+                .style(style_secondary)
+                .on_press(Message::HideContextMenu)
+                .into(),
+        );
+
+        container(column(menu_items).width(200).padding(10))
+            .style(|_| container::Style {
+                background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
+                border: iced::Border {
+                    color: Color::from_rgb(0.35, 0.35, 0.35),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                    offset: iced::Vector::new(2.0, 2.0),
+                    blur_radius: 8.0,
+                },
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_login(&self) -> Element<'_, Message> {
@@ -849,6 +1294,43 @@ impl PCloudGui {
             }
         };
 
+        // Keyboard shortcuts help text
+        let shortcuts_help = column![
+            text("Keyboard Shortcuts")
+                .size(11)
+                .color(Color::from_rgb(0.5, 0.5, 0.5)),
+            Space::with_height(5),
+            text("Ctrl+U  Upload files")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            text("Ctrl+D  Download")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            text("Ctrl+N  New folder")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            text("Ctrl+R / F5  Refresh")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            text("Enter  Open folder")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            text("Backspace  Go up")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            text("Delete  Delete item")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            text("Escape  Cancel/Clear")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+            Space::with_height(5),
+            text("Right-click for menu")
+                .size(10)
+                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+        ]
+        .spacing(2);
+
         container(
             column![
                 text("Actions")
@@ -888,6 +1370,18 @@ impl PCloudGui {
                         b
                     }
                 },
+                Space::with_height(5),
+                {
+                    let b = button(text("📁 New Folder").align_x(alignment::Horizontal::Center))
+                        .width(Length::Fill)
+                        .padding(10)
+                        .style(style_secondary);
+                    if !is_busy {
+                        b.on_press(Message::CreateFolderPressed)
+                    } else {
+                        b
+                    }
+                },
                 Space::with_height(30),
                 text(format!("Concurrency: {}", self.concurrency_setting))
                     .size(12)
@@ -914,6 +1408,8 @@ impl PCloudGui {
                     .padding(8)
                     .style(style_secondary)
                     .on_press(Message::RefreshList),
+                Space::with_height(30),
+                shortcuts_help,
             ]
             .width(200),
         )
@@ -967,12 +1463,12 @@ impl PCloudGui {
                         .unwrap_or(false);
                     let icon = if item.isfolder { "📁" } else { "📄" };
                     let size = item.size;
-                    let name = item.name.clone();
-                    let isfolder = item.isfolder;
+                    let item_clone = item.clone();
+                    let item_for_context = item.clone();
                     let row_c = row![
                         text(icon),
                         Space::with_width(10),
-                        text(name.clone()),
+                        text(item.name.clone()),
                         horizontal_space(),
                         text(format_bytes(size))
                             .size(12)
@@ -980,7 +1476,9 @@ impl PCloudGui {
                     ]
                     .align_y(Alignment::Center)
                     .padding(10);
-                    button(row_c)
+
+                    // Wrap button in mouse_area for right-click detection
+                    let btn = button(row_c)
                         .width(Length::Fill)
                         .style(move |_, s| {
                             let bg = if is_sel {
@@ -996,18 +1494,22 @@ impl PCloudGui {
                                 ..Default::default()
                             }
                         })
-                        .on_press(if isfolder {
-                            Message::NavigateTo(name)
-                        } else {
-                            Message::SelectItem(item)
-                        })
+                        // Single click selects, double-click handled by ItemClicked
+                        .on_press(Message::ItemClicked(item_clone));
+
+                    mouse_area(btn)
+                        .on_right_press(Message::ShowContextMenu(Some(item_for_context)))
                         .into()
                 })
                 .collect::<Vec<_>>(),
         )
         .spacing(2);
 
-        scrollable(list).height(Length::Fill).into()
+        // Wrap the scrollable in a mouse_area for right-click on empty space
+        let scrollable_list = scrollable(list).height(Length::Fill);
+        mouse_area(scrollable_list)
+            .on_right_press(Message::ShowContextMenu(None))
+            .into()
     }
 
     fn view_header(&self) -> Element<'_, Message> {
@@ -1413,6 +1915,28 @@ fn style_clear_btn(_: &Theme, s: button::Status) -> button::Style {
     match s {
         button::Status::Hovered => button::Style {
             text_color: Color::from_rgb(0.8, 0.3, 0.3),
+            ..b
+        },
+        _ => b,
+    }
+}
+
+fn style_context_menu_item(_: &Theme, s: button::Status) -> button::Style {
+    let b = button::Style {
+        background: Some(Color::TRANSPARENT.into()),
+        text_color: Color::from_rgb(0.9, 0.9, 0.9),
+        border: iced::Border::default(),
+        ..Default::default()
+    };
+    match s {
+        button::Status::Hovered => button::Style {
+            background: Some(Color::from_rgb(0.25, 0.4, 0.6).into()),
+            text_color: Color::WHITE,
+            ..b
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(Color::from_rgb(0.2, 0.35, 0.5).into()),
+            text_color: Color::WHITE,
             ..b
         },
         _ => b,
