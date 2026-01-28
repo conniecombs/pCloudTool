@@ -27,6 +27,15 @@ A high-performance Rust tool for uploading and downloading files to/from pCloud 
 | ![Resume](https://img.shields.io/badge/-Resume-0984e3?style=flat-square) | **Resume interrupted transfers** - automatically save and restore progress |
 | ![Progress](https://img.shields.io/badge/-Progress-6c5ce7?style=flat-square) | **Per-file progress tracking** - see exactly which file is transferring |
 
+### New in v0.3.0
+
+| Feature | Description |
+|---------|-------------|
+| ![Adaptive](https://img.shields.io/badge/-Adaptive-e17055?style=flat-square) | **Adaptive worker count** - auto-configures based on CPU cores and memory |
+| ![Chunked](https://img.shields.io/badge/-Chunked-00cec9?style=flat-square) | **Chunked uploads** for large files (>2GB) with progress tracking |
+| ![Timeout](https://img.shields.io/badge/-Timeout-fdcb6e?style=flat-square) | **Per-file timeouts** with automatic retry and exponential backoff |
+| ![Validation](https://img.shields.io/badge/-Validation-a29bfe?style=flat-square) | **State file validation** - detect and repair corrupted resume files |
+
 ## Quick Start
 
 ### Prerequisites
@@ -103,7 +112,7 @@ pcloud-cli list /
 ### Advanced Options
 
 ```bash
-# Configure parallel workers (default: 8)
+# Configure parallel workers (default: 8, max: 32)
 pcloud-cli upload ./data -w 16 -d /Backup
 
 # Choose region (us or eu)
@@ -111,6 +120,20 @@ pcloud-cli upload file.txt -r eu -d /MyFolder
 
 # Handle duplicates: skip, overwrite, or rename
 pcloud-cli upload file.txt --duplicate-mode skip -d /MyFolder
+```
+
+### Adaptive Workers
+
+The library can automatically determine optimal worker count based on your system:
+
+```rust
+// Auto-configure workers based on CPU cores and available memory
+let client = PCloudClient::new_adaptive(None, Region::US);
+
+// Algorithm:
+// - CPU-based: cpu_cores * 2 (I/O bound tasks benefit from more workers)
+// - Memory-based: available_memory_gb * 20 (~50MB per worker)
+// - Uses minimum of both, clamped to 1-32 range
 ```
 
 ## GUI Usage
@@ -157,8 +180,11 @@ use pcloud_rust::{PCloudClient, Region, DuplicateMode, SyncDirection};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize client
-    let mut client = PCloudClient::new(None, Region::US, 8);
+    // Initialize client with adaptive worker count (auto-configures based on system)
+    let mut client = PCloudClient::new_adaptive(None, Region::US);
+
+    // Or specify workers manually
+    // let mut client = PCloudClient::new(None, Region::US, 8);
 
     // Login
     let token = client.login("user@example.com", "password").await?;
@@ -205,8 +231,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 use pcloud_rust::{PCloudClient, TransferState};
 use std::sync::{Arc, atomic::AtomicU64};
 
-// Load saved transfer state
-let mut state = TransferState::load_from_file(".transfer-state.json")?;
+// Load and validate saved transfer state
+let (mut state, validation) = TransferState::load_and_validate(".transfer-state.json")?;
+
+// Check if state file is valid
+if !validation.is_valid {
+    println!("State file has issues: {:?}", validation.issues);
+    if validation.can_repair {
+        let repairs = state.repair();
+        println!("Applied repairs: {:?}", repairs);
+    }
+}
 
 // Resume the transfer
 let bytes_progress = Arc::new(AtomicU64::new(0));
@@ -214,6 +249,32 @@ let (completed, failed) = client.resume_upload(&mut state, bytes_progress, None)
 
 // Save updated state (in case of another interruption)
 state.save_to_file(".transfer-state.json")?;
+```
+
+### Upload Large Files (Chunked)
+
+```rust
+// Upload files >2GB using chunked upload API
+client.upload_large_file_chunked(
+    "/path/to/large-file.zip",
+    "/remote/destination",
+    |uploaded, total| {
+        println!("Progress: {}/{} bytes", uploaded, total);
+    }
+).await?;
+```
+
+### Parallel Uploads with Per-File Timeout and Retry
+
+```rust
+// Upload files with automatic timeout and retry on failure
+let (uploaded, failed, failed_tasks) = client.upload_files_with_timeout(
+    tasks,
+    3,  // max retries per file
+).await;
+
+// failed_tasks contains files that failed even after retries
+println!("Uploaded: {}, Failed: {}", uploaded, failed);
 ```
 
 ## Performance
