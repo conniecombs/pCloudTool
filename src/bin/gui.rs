@@ -3,8 +3,8 @@ use iced::futures::stream::{self, BoxStream, StreamExt};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::time::Instant;
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, mouse_area, opaque,
-    progress_bar, row, scrollable, slider, stack, text, text_input, vertical_rule, Space,
+    button, column, container, horizontal_rule, horizontal_space, mouse_area, opaque, progress_bar,
+    row, scrollable, slider, stack, text, text_input, vertical_rule, Space,
 };
 use iced::{alignment, Alignment, Background, Color, Element, Length, Subscription, Task, Theme};
 
@@ -407,9 +407,8 @@ impl PCloudGui {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keyboard_sub = keyboard::on_key_press(|key, modifiers| {
-            Some(Message::KeyboardEvent(key, modifiers))
-        });
+        let keyboard_sub =
+            keyboard::on_key_press(|key, modifiers| Some(Message::KeyboardEvent(key, modifiers)));
 
         let transfer_sub = if let Some(transfer_type) = &self.active_transfer {
             match transfer_type {
@@ -1217,12 +1216,16 @@ impl PCloudGui {
 
         menu_items.push(Space::with_height(8).into());
         menu_items.push(
-            button(text("Cancel").size(12).align_x(alignment::Horizontal::Center))
-                .width(Length::Fill)
-                .padding([8, 15])
-                .style(style_secondary)
-                .on_press(Message::HideContextMenu)
-                .into(),
+            button(
+                text("Cancel")
+                    .size(12)
+                    .align_x(alignment::Horizontal::Center),
+            )
+            .width(Length::Fill)
+            .padding([8, 15])
+            .style(style_secondary)
+            .on_press(Message::HideContextMenu)
+            .into(),
         );
 
         container(column(menu_items).width(200).padding(10))
@@ -1672,45 +1675,43 @@ impl PCloudGui {
                 };
 
                 // Truncate filename if too long
-                let current_file_display = p.current_file.as_ref().map(|f| {
-                    if f.len() > 25 {
-                        format!("{}...", &f[..22])
-                    } else {
-                        f.clone()
-                    }
-                }).unwrap_or_default();
+                let current_file_display = p
+                    .current_file
+                    .as_ref()
+                    .map(|f| {
+                        if f.len() > 25 {
+                            format!("{}...", &f[..22])
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .unwrap_or_default();
 
-                row![
-                    column![
-                        row![
-                            progress_bar(0.0..=100.0, pct)
-                                .height(8)
-                                .width(Length::Fixed(200.0))
-                                .style(style_bar),
-                            Space::with_width(10),
-                            text(format!(
-                                "{}/{} files • {:.1}%",
-                                p.finished_files,
-                                p.total_files,
-                                pct
-                            ))
-                            .size(11)
-                        ]
-                        .align_y(Alignment::Center),
-                        row![
-                            text(format!(
-                                "📄 {} • {} / {} • {:.1} MB/s",
-                                current_file_display,
-                                format_bytes(p.transferred_bytes),
-                                format_bytes(p.total_bytes),
-                                p.current_speed / 1_000_000.0
-                            ))
-                            .size(10)
-                            .color(Color::from_rgb(0.6, 0.6, 0.6))
-                        ]
+                row![column![
+                    row![
+                        progress_bar(0.0..=100.0, pct)
+                            .height(8)
+                            .width(Length::Fixed(200.0))
+                            .style(style_bar),
+                        Space::with_width(10),
+                        text(format!(
+                            "{}/{} files • {:.1}%",
+                            p.finished_files, p.total_files, pct
+                        ))
+                        .size(11)
                     ]
-                    .spacing(2)
+                    .align_y(Alignment::Center),
+                    row![text(format!(
+                        "📄 {} • {} / {} • {:.1} MB/s",
+                        current_file_display,
+                        format_bytes(p.transferred_bytes),
+                        format_bytes(p.total_bytes),
+                        p.current_speed / 1_000_000.0
+                    ))
+                    .size(10)
+                    .color(Color::from_rgb(0.6, 0.6, 0.6))]
                 ]
+                .spacing(2)]
                 .align_y(Alignment::Center)
             }
         };

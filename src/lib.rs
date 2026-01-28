@@ -1236,13 +1236,13 @@ impl PCloudClient {
         let api_resp: ChecksumResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
 
         if api_resp.result == 0 {
-            api_resp.sha256.ok_or_else(|| {
-                PCloudError::ApiError("No checksum in response".to_string())
-            })
+            api_resp
+                .sha256
+                .ok_or_else(|| PCloudError::ApiError("No checksum in response".to_string()))
         } else {
-            Err(PCloudError::ApiError(
-                api_resp.error.unwrap_or_else(|| format!("Error code: {}", api_resp.result)),
-            ))
+            Err(PCloudError::ApiError(api_resp.error.unwrap_or_else(|| {
+                format!("Error code: {}", api_resp.result)
+            })))
         }
     }
 
@@ -1323,7 +1323,8 @@ impl PCloudClient {
         // Find files that exist remotely but not locally
         for filename in remote_files.keys() {
             if !local_files.contains_key(filename) {
-                let remote_file_path = format!("{}/{}", remote_path.trim_end_matches('/'), filename);
+                let remote_file_path =
+                    format!("{}/{}", remote_path.trim_end_matches('/'), filename);
                 to_download.push((remote_file_path, local_path.to_string()));
             }
         }
@@ -1343,7 +1344,9 @@ impl PCloudClient {
         self.create_folder(remote_path).await?;
 
         // Compare folders
-        let (to_upload, to_download) = self.compare_folders(local_path, remote_path, use_checksum).await?;
+        let (to_upload, to_download) = self
+            .compare_folders(local_path, remote_path, use_checksum)
+            .await?;
 
         let mut result = SyncResult {
             uploaded: 0,
@@ -1415,8 +1418,12 @@ impl PCloudClient {
         total_result.downloaded += root_result.downloaded;
         total_result.skipped += root_result.skipped;
         total_result.failed += root_result.failed;
-        total_result.files_to_upload.extend(root_result.files_to_upload);
-        total_result.files_to_download.extend(root_result.files_to_download);
+        total_result
+            .files_to_upload
+            .extend(root_result.files_to_upload);
+        total_result
+            .files_to_download
+            .extend(root_result.files_to_download);
 
         // Find and sync subfolders
         let local_root_path = Path::new(local_root);
@@ -1446,8 +1453,12 @@ impl PCloudClient {
                         total_result.downloaded += sub_result.downloaded;
                         total_result.skipped += sub_result.skipped;
                         total_result.failed += sub_result.failed;
-                        total_result.files_to_upload.extend(sub_result.files_to_upload);
-                        total_result.files_to_download.extend(sub_result.files_to_download);
+                        total_result
+                            .files_to_upload
+                            .extend(sub_result.files_to_upload);
+                        total_result
+                            .files_to_download
+                            .extend(sub_result.files_to_download);
                     }
                 }
             }
