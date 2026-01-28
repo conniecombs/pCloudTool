@@ -208,9 +208,10 @@ async fn authenticate_client(
     // Otherwise, authenticate with username/password
     if let (Some(user), Some(pass)) = (username, password) {
         match client.login(&user, &pass).await {
-            Ok(token) => {
+            Ok(_token) => {
                 println!("✓ Authenticated successfully");
-                println!("✓ Token: {}", token);
+                // Note: Token is not printed for security reasons.
+                // Use PCLOUD_TOKEN env var to reuse the token in future sessions.
                 return Ok(client);
             }
             Err(e) => {
