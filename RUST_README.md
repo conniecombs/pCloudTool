@@ -25,6 +25,13 @@ A blazing-fast, memory-efficient Rust implementation of the pCloud file transfer
 - 📊 **Per-File Progress**: Track exactly which file is being transferred in real-time
 - 🔍 **Smart Comparison**: Sync based on file size or cryptographic checksums
 
+🆕 **New in v0.3.0:**
+- 🧠 **Adaptive Workers**: Auto-configure worker count based on CPU cores and available memory
+- 📦 **Chunked Uploads**: Upload large files (>2GB) in chunks with progress tracking
+- ⏱️ **Per-File Timeouts**: Size-based timeouts with automatic retry and exponential backoff
+- 🔧 **State File Validation**: Detect and repair corrupted resume state files
+- ✅ **Integrity Checksums**: SHA256 checksums for state file integrity verification
+
 ## Installation
 
 ### Prerequisites
@@ -264,11 +271,51 @@ async fn resume_download(&self, state: &mut TransferState, bytes_progress: Arc<A
 
 #### Transfer State Management
 ```rust
-// Save transfer state to file
+// Save transfer state to file (with checksum)
 fn save_to_file(&self, path: &str) -> Result<()>
 
 // Load transfer state from file
 fn load_from_file(path: &str) -> Result<TransferState>
+
+// Load and validate state file
+fn load_and_validate(path: &str) -> Result<(TransferState, StateValidation)>
+
+// Validate state file integrity
+fn validate(&self) -> StateValidation
+
+// Repair corrupted state file
+fn repair(&mut self) -> Vec<String>
+```
+
+#### Adaptive Workers
+```rust
+// Create client with adaptive worker count
+fn new_adaptive(token: Option<String>, region: Region) -> Self
+
+// Calculate optimal workers based on system resources
+fn calculate_adaptive_workers() -> usize
+```
+
+#### Per-File Timeout Operations
+```rust
+// Upload with per-file timeout (size-based)
+async fn upload_file_with_timeout(&self, local_path: &str, remote_path: &str) -> Result<()>
+
+// Download with per-file timeout
+async fn download_file_with_timeout(&self, remote_path: &str, local_folder: &str, expected_size: Option<u64>) -> Result<String>
+
+// Parallel uploads with timeout and retry
+async fn upload_files_with_timeout(&self, tasks: Vec<(String, String)>, max_retries: u32) -> (u32, u32, Vec<(String, String)>)
+
+// Parallel downloads with timeout and retry
+async fn download_files_with_timeout(&self, tasks: Vec<(String, String)>, max_retries: u32) -> (u32, u32, Vec<(String, String)>)
+```
+
+#### Chunked Uploads (Large Files)
+```rust
+// Upload large files in chunks (>2GB)
+async fn upload_large_file_chunked<F>(&self, local_path: &str, remote_path: &str, progress_callback: F) -> Result<()>
+where F: FnMut(u64, u64) + Send + Sync + 'static
 ```
 
 ## Sync Mode
@@ -347,6 +394,120 @@ state.save_to_file(".transfer-state.json")?;
 | `pending_files` | `Vec<(String, String)>` | Files still to be transferred |
 | `total_bytes` | `u64` | Total bytes to transfer |
 | `transferred_bytes` | `u64` | Bytes transferred so far |
+| `version` | `u32` | State file format version |
+| `checksum` | `Option<String>` | SHA256 checksum for integrity |
+
+## State File Validation
+
+The library includes robust state file validation and repair:
+
+```rust
+use pcloud_rust::TransferState;
+
+// Load and validate a state file
+let (mut state, validation) = TransferState::load_and_validate(".transfer-state.json")?;
+
+if !validation.is_valid {
+    println!("Issues found: {:?}", validation.issues);
+
+    if validation.can_repair {
+        let repairs = state.repair();
+        println!("Applied repairs: {:?}", repairs);
+
+        // Save repaired state
+        state.save_to_file(".transfer-state.json")?;
+    }
+}
+```
+
+### Validation Checks
+
+| Check | Description |
+|-------|-------------|
+| Checksum | Verifies SHA256 hash matches stored checksum |
+| File Counts | Ensures completed + failed + pending = total |
+| Duplicates | Detects duplicate entries in file lists |
+| Byte Consistency | Verifies transferred_bytes <= total_bytes |
+| Direction | Validates direction is "upload" or "download" |
+| UUID | Verifies state ID is a valid UUID |
+
+### Repair Operations
+
+| Repair | Description |
+|--------|-------------|
+| Remove Duplicates | Removes duplicate entries from file lists |
+| Fix Counts | Corrects total_files to match actual count |
+| Cap Bytes | Ensures transferred_bytes doesn't exceed total |
+| Regenerate UUID | Creates new UUID if current one is invalid |
+| Update Checksum | Recalculates and stores new checksum |
+
+## Adaptive Worker Configuration
+
+The library can auto-configure optimal worker count:
+
+```rust
+use pcloud_rust::{PCloudClient, Region};
+
+// Auto-configure based on system resources
+let client = PCloudClient::new_adaptive(None, Region::US);
+
+// Or get the calculated value
+let optimal_workers = PCloudClient::calculate_adaptive_workers();
+println!("Optimal workers for this system: {}", optimal_workers);
+```
+
+### Algorithm
+
+```
+CPU-based:    cpu_cores * 2 (I/O bound tasks)
+Memory-based: available_memory_gb * 20 (~50MB per worker)
+Result:       min(cpu_based, memory_based).clamp(1, 32)
+```
+
+## Per-File Timeout Configuration
+
+Configure timeouts based on file size:
+
+```rust
+use pcloud_rust::{PCloudClient, FileTimeoutConfig};
+
+let mut client = PCloudClient::new(None, Region::US, 8);
+
+// Configure timeout: base + (size_mb * secs_per_mb), capped at max
+client.set_file_timeout_config(FileTimeoutConfig {
+    base_timeout_secs: 60,      // Base timeout for any file
+    secs_per_mb: 2,             // Additional seconds per MB
+    max_timeout_secs: 600,      // Maximum timeout (10 minutes)
+});
+
+// Example: 100MB file = 60 + (100 * 2) = 260 seconds timeout
+```
+
+## Chunked Upload Configuration
+
+Configure chunked uploads for large files:
+
+```rust
+use pcloud_rust::{PCloudClient, ChunkedUploadConfig};
+
+let mut client = PCloudClient::new(None, Region::US, 8);
+
+client.set_chunked_upload_config(ChunkedUploadConfig {
+    threshold_bytes: 2 * 1024 * 1024 * 1024,  // 2GB threshold
+    chunk_size: 10 * 1024 * 1024,              // 10MB chunks
+    enabled: true,
+});
+
+// Upload large file with progress
+client.upload_large_file_chunked(
+    "/path/to/4gb-file.zip",
+    "/remote/backup",
+    |uploaded, total| {
+        let percent = (uploaded as f64 / total as f64) * 100.0;
+        println!("Progress: {:.1}%", percent);
+    }
+).await?;
+```
 
 ## Performance
 
@@ -376,6 +537,8 @@ Core dependencies:
 - `serde` - Serialization
 - `walkdir` - Directory traversal
 - `thiserror` - Error handling
+- `sysinfo` - System info for adaptive workers
+- `sha2` / `hex` - SHA256 checksums for sync and state validation
 
 ## Security
 

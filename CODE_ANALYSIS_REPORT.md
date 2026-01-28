@@ -1,6 +1,7 @@
 # pCloudTool Code Analysis Report
 
 **Date:** 2026-01-28
+**Updated:** 2026-01-28
 **Analyzed Files:** `src/lib.rs`, `src/bin/cli.rs`, `src/bin/gui.rs`, `Cargo.toml`, `tests/integration_test.rs`, `.github/workflows/ci.yml`
 
 ---
@@ -10,6 +11,25 @@
 pCloudTool is a well-architected Rust application for pCloud file transfers with both CLI and GUI interfaces. The codebase demonstrates good practices in many areas, but several issues and improvement opportunities were identified during this analysis.
 
 **Overall Assessment:** Good quality code with room for improvement in error handling, testing, and some edge cases.
+
+### Update: Issues Fixed
+
+The following high-priority issues have been addressed:
+
+| Issue | Status | Fix Description |
+|-------|--------|-----------------|
+| Retry logic bug | ✅ Fixed | Refactored to check retryable first, then max retries |
+| Token exposure in CLI | ✅ Fixed | Removed token printing from CLI output |
+| Silent errors in download_folder_tree | ✅ Fixed | Added tracing warnings for failed folders |
+| Missing worker validation | ✅ Fixed | Added clamp(1, 32) validation |
+| No per-file timeout | ✅ Fixed | Added FileTimeoutConfig with size-based timeouts |
+
+Additional improvements implemented:
+- ✅ State file validation with SHA256 checksums
+- ✅ State file repair for corrupted files
+- ✅ Adaptive worker count based on CPU/memory
+- ✅ Chunked uploads for large files (>2GB)
+- ✅ Per-file timeout with automatic retry
 
 ---
 
@@ -28,30 +48,17 @@ pCloudTool is a well-architected Rust application for pCloud file transfers with
 
 ## 1. Potential Bugs
 
-### 1.1 Retry Logic Bug in `with_retry` Method
+### 1.1 ~~Retry Logic Bug in `with_retry` Method~~ ✅ FIXED
 
 **Location:** `src/lib.rs:411-444`
 
-**Issue:** The retry logic has a duplicate check for `attempt > self.retry_config.max_retries` which creates confusing control flow.
+**Status:** ✅ **FIXED** in commit `6bf591c`
 
+**Issue:** The retry logic had a duplicate check for `attempt > self.retry_config.max_retries` which created confusing control flow.
+
+**Fix Applied:**
 ```rust
-// Current code has this structure:
-if attempt > self.retry_config.max_retries {
-    let retry = match &e { ... };  // Check if retryable
-    if !retry {
-        return Err(e);  // This only returns for non-retryable errors
-    }
-}
-
-if attempt > self.retry_config.max_retries {  // Duplicate check
-    return Err(e);
-}
-```
-
-**Impact:** The first condition is ineffective because the retry check happens after max_retries is exceeded.
-
-**Recommendation:** Refactor to:
-```rust
+// Now checks retryable first, then max retries
 let is_retryable = match &e {
     PCloudError::NetworkError(_) => true,
     PCloudError::ApiError(s) => s.starts_with("HTTP error: 5"),
@@ -63,18 +70,15 @@ if !is_retryable || attempt > self.retry_config.max_retries {
 }
 ```
 
-### 1.2 Silent Error Suppression in `download_folder_tree`
+### 1.2 ~~Silent Error Suppression in `download_folder_tree`~~ ✅ FIXED
 
 **Location:** `src/lib.rs:900`
 
-**Issue:** Errors during folder listing are silently ignored:
-```rust
-Err(_e) => {}  // Silently ignored
-```
+**Status:** ✅ **FIXED** in commit `6bf591c`
 
-**Impact:** Users won't know if some folders failed to download due to permission issues or network errors.
+**Issue:** Errors during folder listing were silently ignored.
 
-**Recommendation:** Track and report failed folders, or at minimum log the error.
+**Fix Applied:** Now logs warnings via tracing when folders fail to list, tracks failed folders, and logs summary at end.
 
 ### 1.3 Potential Integer Overflow in `format_bytes`
 
@@ -91,18 +95,21 @@ let unit_index = exp.saturating_sub(1);
 
 **Recommendation:** Add bounds checking and handle edge cases explicitly.
 
-### 1.4 Missing Validation for Workers Count
+### 1.4 ~~Missing Validation for Workers Count~~ ✅ FIXED
 
 **Location:** `src/lib.rs:329`, `src/bin/cli.rs:35`
 
-**Issue:** The `workers` parameter has no upper bound validation in the library. CLI limits to UI but library accepts any `usize`.
+**Status:** ✅ **FIXED** in commit `9341a75`
 
-**Impact:** Excessive worker counts could exhaust system resources.
+**Issue:** The `workers` parameter had no upper bound validation in the library.
 
-**Recommendation:** Add validation in `PCloudClient::new()`:
+**Fix Applied:**
 ```rust
-let workers = workers.clamp(1, 50);  // Reasonable limits
+// Now clamps workers to valid range
+let workers = workers.clamp(MIN_WORKERS, MAX_WORKERS); // 1-32
 ```
+
+Additionally, added `new_adaptive()` constructor that auto-configures based on system resources.
 
 ### 1.5 Double-Click Detection Race Condition
 
@@ -116,18 +123,15 @@ let workers = workers.clamp(1, 50);  // Reasonable limits
 
 ## 2. Security Concerns
 
-### 2.1 Auth Token Exposed in Login Output
+### 2.1 ~~Auth Token Exposed in Login Output~~ ✅ FIXED
 
 **Location:** `src/bin/cli.rs:213`
 
-**Issue:** The authentication token is printed to stdout:
-```rust
-println!("✓ Token: {}", token);
-```
+**Status:** ✅ **FIXED** in commit `6bf591c`
 
-**Impact:** Tokens could end up in logs, terminal history, or CI outputs.
+**Issue:** The authentication token was printed to stdout.
 
-**Recommendation:** Only print token if explicitly requested via `--show-token` flag, or mask it partially.
+**Fix Applied:** Removed token printing from CLI output. Added comment explaining token can be reused via env var.
 
 ### 2.2 No TLS Certificate Validation Configuration
 
@@ -323,13 +327,18 @@ let _ = self.delete_file(&full_remote).await;
 
 **Impact:** If delete fails during overwrite operation, the user won't know.
 
-### 5.4 No Timeout Handling for Individual Operations
+### 5.4 ~~No Timeout Handling for Individual Operations~~ ✅ FIXED
 
 **Location:** `src/lib.rs`
 
-**Issue:** While global timeouts exist, individual operations don't have specific timeout handling.
+**Status:** ✅ **FIXED** in commit `9341a75`
 
-**Impact:** A single slow file could cause perceived hangs.
+**Issue:** While global timeouts existed, individual operations didn't have specific timeout handling.
+
+**Fix Applied:** Added `FileTimeoutConfig` with size-based timeout calculation:
+- `upload_file_with_timeout()` and `download_file_with_timeout()`
+- `upload_files_with_timeout()` and `download_files_with_timeout()` with per-file retry
+- Configurable: base_timeout + (size_mb * secs_per_mb), capped at max_timeout
 
 ---
 
@@ -462,38 +471,59 @@ remote_path: String,
 
 ## Summary of Recommendations
 
-### High Priority (Bugs/Security)
+### High Priority (Bugs/Security) - ✅ ALL FIXED
 
-1. Fix retry logic in `with_retry` method
-2. Remove token printing from CLI output
-3. Add proper error handling for silent failures
-4. Validate worker count bounds
+1. ✅ ~~Fix retry logic in `with_retry` method~~ - Fixed in commit `6bf591c`
+2. ✅ ~~Remove token printing from CLI output~~ - Fixed in commit `6bf591c`
+3. ✅ ~~Add proper error handling for silent failures~~ - Fixed in commit `6bf591c`
+4. ✅ ~~Validate worker count bounds~~ - Fixed in commit `9341a75`
 
 ### Medium Priority (Code Quality)
 
-5. Consolidate duplicate size formatting functions
-6. Replace magic numbers with named constants
-7. Use `HashSet` for completed/failed file tracking
-8. Add unit tests for core logic
+5. ⏳ Consolidate duplicate size formatting functions
+6. ⏳ Replace magic numbers with named constants
+7. ⏳ Use `HashSet` for completed/failed file tracking
+8. ⏳ Add unit tests for core logic
 
 ### Low Priority (Enhancements)
 
-9. Add bandwidth throttling
-10. Implement drag-and-drop in GUI
-11. Add system notifications
-12. Improve CLI help text with examples
+9. ⏳ Add bandwidth throttling
+10. ⏳ Implement drag-and-drop in GUI
+11. ⏳ Add system notifications
+12. ⏳ Improve CLI help text with examples
+
+---
+
+## Additional Improvements Implemented
+
+Beyond the original recommendations, the following enhancements were added:
+
+### Resume Robustness (commit `9341a75`)
+- State file checksum validation (SHA256)
+- State file repair for corrupted files
+- Version field for forward compatibility
+- Validation checks: duplicates, counts, bytes, UUID
+
+### Performance Optimizations (commit `9341a75`)
+- Adaptive worker count based on CPU cores and memory
+- Chunked uploads for large files (>2GB)
+- Per-file timeout with automatic retry
+- Exponential backoff between retries
 
 ---
 
 ## Files Changed
 
-This analysis did not modify any source files. It is a read-only review.
+| Commit | Files Modified | Description |
+|--------|----------------|-------------|
+| `6bf591c` | `src/lib.rs`, `src/bin/cli.rs` | High priority bug/security fixes |
+| `9341a75` | `src/lib.rs`, `Cargo.toml` | Resume robustness and performance |
 
 ---
 
-## How to Address These Issues
+## How to Address Remaining Issues
 
-For each issue, I recommend:
+For each remaining issue, I recommend:
 
 1. Create a GitHub issue with the details
 2. Prioritize based on severity (bugs > security > quality > enhancements)
@@ -503,3 +533,4 @@ For each issue, I recommend:
 ---
 
 *Generated by code analysis on 2026-01-28*
+*Updated with fixes on 2026-01-28*
