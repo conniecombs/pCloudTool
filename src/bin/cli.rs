@@ -596,7 +596,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("   Local:     {}", local_path);
             println!("   Remote:    {}", remote_path);
             println!("   Direction: {}", direction_str);
-            println!("   Checksum:  {}", if checksum { "enabled" } else { "disabled (size comparison)" });
+            println!(
+                "   Checksum:  {}",
+                if checksum {
+                    "enabled"
+                } else {
+                    "disabled (size comparison)"
+                }
+            );
             println!("   Recursive: {}", if recursive { "yes" } else { "no" });
             println!();
 
@@ -645,7 +652,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\n🔄 Resuming transfer...");
             println!("   Transfer ID: {}", state.id);
             println!("   Direction:   {}", state.direction);
-            println!("   Completed:   {}/{} files", state.completed_files.len(), state.total_files);
+            println!(
+                "   Completed:   {}/{} files",
+                state.completed_files.len(),
+                state.total_files
+            );
             println!("   Pending:     {} files", state.pending_files.len());
             println!("   Failed:      {} files", state.failed_files.len());
             println!();
@@ -676,8 +687,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0.0
                     };
                     if current != last_bytes {
-                        print!("\r  Progress: {} ({:.2} MB/s)     ",
-                            format_size(current), speed);
+                        print!(
+                            "\r  Progress: {} ({:.2} MB/s)     ",
+                            format_size(current),
+                            speed
+                        );
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                         last_bytes = current;
                     }
@@ -685,9 +699,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             let (completed, failed) = if state.direction == "upload" {
-                client.resume_upload(&mut state, bytes_progress.clone(), None).await
+                client
+                    .resume_upload(&mut state, bytes_progress.clone(), None)
+                    .await
             } else {
-                client.resume_download(&mut state, bytes_progress.clone(), None).await
+                client
+                    .resume_download(&mut state, bytes_progress.clone(), None)
+                    .await
             };
 
             progress_handle.abort();
@@ -706,7 +724,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!();
 
             if !state.pending_files.is_empty() {
-                println!("Note: {} files still pending. Run resume again to continue.", state.pending_files.len());
+                println!(
+                    "Note: {} files still pending. Run resume again to continue.",
+                    state.pending_files.len()
+                );
             }
 
             if failed > 0 {
