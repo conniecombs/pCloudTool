@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tracing::warn;
 use walkdir::WalkDir;
 
 const API_US: &str = "https://api.pcloud.com";
@@ -421,20 +422,20 @@ impl PCloudClient {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     attempt += 1;
-                    if attempt > self.retry_config.max_retries {
-                        let retry = match &e {
-                            PCloudError::NetworkError(_) => true,
-                            PCloudError::ApiError(s) => s.starts_with("HTTP error: 5"),
-                            _ => false,
-                        };
-                        if !retry {
-                            return Err(e);
-                        }
-                    }
 
-                    if attempt > self.retry_config.max_retries {
+                    // Check if error is retryable (network errors or 5xx HTTP errors)
+                    let is_retryable = match &e {
+                        PCloudError::NetworkError(_) => true,
+                        PCloudError::ApiError(s) => s.starts_with("HTTP error: 5"),
+                        _ => false,
+                    };
+
+                    // Return immediately if error is not retryable or max retries exceeded
+                    if !is_retryable || attempt > self.retry_config.max_retries {
                         return Err(e);
                     }
+
+                    // Wait before retrying with exponential backoff
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     delay = ((delay as f64) * self.retry_config.backoff_multiplier) as u64;
                     delay = delay.min(self.retry_config.max_delay_ms);
@@ -859,6 +860,7 @@ impl PCloudClient {
     ) -> Result<Vec<(String, String)>> {
         let mut files_to_download = Vec::new();
         let mut queue = vec![remote_root.clone()];
+        let mut failed_folders: Vec<(String, String)> = Vec::new();
 
         let folder_name = Path::new(&remote_root)
             .file_name()
@@ -897,9 +899,26 @@ impl PCloudClient {
                         }
                     }
                 }
-                Err(_e) => {}
+                Err(e) => {
+                    // Log the error instead of silently ignoring it
+                    warn!(
+                        folder = %current_remote_path,
+                        error = %e,
+                        "Failed to list remote folder during download tree traversal"
+                    );
+                    failed_folders.push((current_remote_path, e.to_string()));
+                }
             }
         }
+
+        // Log summary if there were failures
+        if !failed_folders.is_empty() {
+            warn!(
+                failed_count = failed_folders.len(),
+                "Some folders could not be listed during download tree traversal"
+            );
+        }
+
         Ok(files_to_download)
     }
 
