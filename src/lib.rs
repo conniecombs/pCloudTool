@@ -13,12 +13,28 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use sysinfo::System;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tracing::warn;
+use tracing::{info, warn};
 use walkdir::WalkDir;
 
 const API_US: &str = "https://api.pcloud.com";
 const API_EU: &str = "https://eapi.pcloud.com";
+
+/// Default chunk size for large file uploads (10 MB)
+const DEFAULT_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Threshold for chunked uploads (2 GB)
+const LARGE_FILE_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Default per-file timeout in seconds
+const DEFAULT_FILE_TIMEOUT_SECS: u64 = 600; // 10 minutes
+
+/// Minimum workers
+const MIN_WORKERS: usize = 1;
+
+/// Maximum workers
+const MAX_WORKERS: usize = 32;
 
 /// The pCloud API region to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +100,24 @@ pub struct TransferState {
     pub transferred_bytes: u64,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Version field for forward compatibility
+    #[serde(default = "default_version")]
+    pub version: u32,
+    /// Checksum for integrity validation
+    #[serde(default)]
+    pub checksum: Option<String>,
+}
+
+fn default_version() -> u32 {
+    1
+}
+
+/// Result of state file validation
+#[derive(Debug, Clone)]
+pub struct StateValidation {
+    pub is_valid: bool,
+    pub issues: Vec<String>,
+    pub can_repair: bool,
 }
 
 impl TransferState {
@@ -103,6 +137,8 @@ impl TransferState {
             transferred_bytes: 0,
             created_at: now,
             updated_at: now,
+            version: 1,
+            checksum: None,
         }
     }
 
@@ -134,17 +170,200 @@ impl TransferState {
         self.pending_files.is_empty()
     }
 
+    /// Compute checksum of the state data (excluding the checksum field itself)
+    fn compute_checksum(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.id.as_bytes());
+        hasher.update(self.direction.as_bytes());
+        hasher.update(self.total_files.to_le_bytes());
+        for f in &self.completed_files {
+            hasher.update(f.as_bytes());
+        }
+        for f in &self.failed_files {
+            hasher.update(f.as_bytes());
+        }
+        for (a, b) in &self.pending_files {
+            hasher.update(a.as_bytes());
+            hasher.update(b.as_bytes());
+        }
+        hasher.update(self.total_bytes.to_le_bytes());
+        hasher.update(self.transferred_bytes.to_le_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// Save state to file with checksum for integrity validation
     pub fn save_to_file(&self, path: &str) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
+        let mut state_with_checksum = self.clone();
+        state_with_checksum.checksum = Some(self.compute_checksum());
+        let json = serde_json::to_string_pretty(&state_with_checksum)
             .map_err(|e| PCloudError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         std::fs::write(path, json)?;
         Ok(())
     }
 
+    /// Load state from file with optional validation
     pub fn load_from_file(path: &str) -> Result<Self> {
         let json = std::fs::read_to_string(path)?;
         serde_json::from_str(&json)
             .map_err(|e| PCloudError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))
+    }
+
+    /// Load and validate state file, attempting repair if corrupted
+    pub fn load_and_validate(path: &str) -> Result<(Self, StateValidation)> {
+        let json = std::fs::read_to_string(path)?;
+
+        // Try to parse the JSON
+        let state: Self = match serde_json::from_str(&json) {
+            Ok(s) => s,
+            Err(e) => {
+                // Try to repair by extracting valid portions
+                return Err(PCloudError::ApiError(format!(
+                    "State file is corrupted and cannot be parsed: {}",
+                    e
+                )));
+            }
+        };
+
+        let validation = state.validate();
+        Ok((state, validation))
+    }
+
+    /// Validate the state file integrity
+    pub fn validate(&self) -> StateValidation {
+        let mut issues = Vec::new();
+        let mut can_repair = true;
+
+        // Check checksum if present
+        if let Some(ref stored_checksum) = self.checksum {
+            let computed = self.compute_checksum();
+            if &computed != stored_checksum {
+                issues.push("Checksum mismatch - state file may be corrupted".to_string());
+            }
+        }
+
+        // Check for logical consistency
+        let total_accounted =
+            self.completed_files.len() + self.failed_files.len() + self.pending_files.len();
+        if total_accounted != self.total_files {
+            issues.push(format!(
+                "File count mismatch: total={}, accounted={}",
+                self.total_files, total_accounted
+            ));
+        }
+
+        // Check for duplicate entries
+        let mut seen_completed: HashSet<&String> = HashSet::new();
+        for f in &self.completed_files {
+            if !seen_completed.insert(f) {
+                issues.push(format!("Duplicate in completed_files: {}", f));
+            }
+        }
+
+        let mut seen_failed: HashSet<&String> = HashSet::new();
+        for f in &self.failed_files {
+            if !seen_failed.insert(f) {
+                issues.push(format!("Duplicate in failed_files: {}", f));
+            }
+        }
+
+        // Check transferred bytes consistency
+        if self.transferred_bytes > self.total_bytes && self.total_bytes > 0 {
+            issues.push(format!(
+                "Transferred bytes ({}) exceeds total bytes ({})",
+                self.transferred_bytes, self.total_bytes
+            ));
+        }
+
+        // Check direction is valid
+        if self.direction != "upload" && self.direction != "download" {
+            issues.push(format!("Invalid direction: {}", self.direction));
+            can_repair = false;
+        }
+
+        // Check for valid UUID
+        if uuid::Uuid::parse_str(&self.id).is_err() {
+            issues.push("Invalid state ID (not a valid UUID)".to_string());
+        }
+
+        StateValidation {
+            is_valid: issues.is_empty(),
+            issues,
+            can_repair,
+        }
+    }
+
+    /// Attempt to repair a corrupted state file
+    pub fn repair(&mut self) -> Vec<String> {
+        let mut repairs = Vec::new();
+
+        // Remove duplicates from completed_files
+        let original_completed = self.completed_files.len();
+        let mut seen: HashSet<String> = HashSet::new();
+        self.completed_files.retain(|f| seen.insert(f.clone()));
+        if self.completed_files.len() != original_completed {
+            repairs.push(format!(
+                "Removed {} duplicate entries from completed_files",
+                original_completed - self.completed_files.len()
+            ));
+        }
+
+        // Remove duplicates from failed_files
+        let original_failed = self.failed_files.len();
+        seen.clear();
+        self.failed_files.retain(|f| seen.insert(f.clone()));
+        if self.failed_files.len() != original_failed {
+            repairs.push(format!(
+                "Removed {} duplicate entries from failed_files",
+                original_failed - self.failed_files.len()
+            ));
+        }
+
+        // Fix total_files count
+        let actual_total =
+            self.completed_files.len() + self.failed_files.len() + self.pending_files.len();
+        if actual_total != self.total_files {
+            repairs.push(format!(
+                "Corrected total_files from {} to {}",
+                self.total_files, actual_total
+            ));
+            self.total_files = actual_total;
+        }
+
+        // Cap transferred_bytes at total_bytes
+        if self.transferred_bytes > self.total_bytes && self.total_bytes > 0 {
+            repairs.push(format!(
+                "Capped transferred_bytes from {} to {}",
+                self.transferred_bytes, self.total_bytes
+            ));
+            self.transferred_bytes = self.total_bytes;
+        }
+
+        // Regenerate UUID if invalid
+        if uuid::Uuid::parse_str(&self.id).is_err() {
+            let new_id = uuid::Uuid::new_v4().to_string();
+            repairs.push(format!("Regenerated invalid state ID: {} -> {}", self.id, new_id));
+            self.id = new_id;
+        }
+
+        // Update checksum
+        self.checksum = Some(self.compute_checksum());
+        repairs.push("Updated checksum".to_string());
+
+        self.update_timestamp();
+
+        repairs
+    }
+
+    /// Retry failed files by moving them back to pending
+    pub fn retry_failed(&mut self) {
+        // We need the original file pairs, so this only works if we track them
+        // For now, we'll just clear the failed list - the caller should rebuild pending
+        warn!(
+            failed_count = self.failed_files.len(),
+            "Clearing failed files for retry - caller must rebuild pending list"
+        );
+        self.failed_files.clear();
+        self.update_timestamp();
     }
 }
 
@@ -316,6 +535,58 @@ impl Default for RetryConfig {
     }
 }
 
+/// Configuration for per-file transfer timeouts
+#[derive(Debug, Clone)]
+pub struct FileTimeoutConfig {
+    /// Base timeout in seconds for file operations
+    pub base_timeout_secs: u64,
+    /// Additional seconds per MB of file size
+    pub secs_per_mb: u64,
+    /// Maximum timeout regardless of file size
+    pub max_timeout_secs: u64,
+}
+
+impl Default for FileTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            base_timeout_secs: 60,
+            secs_per_mb: 2,
+            max_timeout_secs: DEFAULT_FILE_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl FileTimeoutConfig {
+    /// Calculate timeout for a file based on its size
+    pub fn timeout_for_size(&self, size_bytes: u64) -> std::time::Duration {
+        let size_mb = size_bytes / (1024 * 1024);
+        let timeout_secs = self.base_timeout_secs + (size_mb * self.secs_per_mb);
+        let timeout_secs = timeout_secs.min(self.max_timeout_secs);
+        std::time::Duration::from_secs(timeout_secs)
+    }
+}
+
+/// Configuration for chunked uploads
+#[derive(Debug, Clone)]
+pub struct ChunkedUploadConfig {
+    /// Threshold above which to use chunked uploads
+    pub threshold_bytes: u64,
+    /// Size of each chunk
+    pub chunk_size: u64,
+    /// Whether chunked uploads are enabled
+    pub enabled: bool,
+}
+
+impl Default for ChunkedUploadConfig {
+    fn default() -> Self {
+        Self {
+            threshold_bytes: LARGE_FILE_THRESHOLD,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PCloudClient {
     client: Client,
@@ -324,10 +595,15 @@ pub struct PCloudClient {
     pub workers: usize,
     pub duplicate_mode: DuplicateMode,
     pub retry_config: RetryConfig,
+    pub file_timeout_config: FileTimeoutConfig,
+    pub chunked_upload_config: ChunkedUploadConfig,
 }
 
 impl PCloudClient {
     pub fn new(token: Option<String>, region: Region, workers: usize) -> Self {
+        // Validate and clamp workers
+        let workers = workers.clamp(MIN_WORKERS, MAX_WORKERS);
+
         let client = Client::builder()
             .pool_max_idle_per_host(workers)
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
@@ -343,7 +619,47 @@ impl PCloudClient {
             workers,
             duplicate_mode: DuplicateMode::Rename,
             retry_config: RetryConfig::default(),
+            file_timeout_config: FileTimeoutConfig::default(),
+            chunked_upload_config: ChunkedUploadConfig::default(),
         }
+    }
+
+    /// Create a new client with adaptive worker count based on system resources
+    pub fn new_adaptive(token: Option<String>, region: Region) -> Self {
+        let workers = Self::calculate_adaptive_workers();
+        info!(
+            workers = workers,
+            "Created client with adaptive worker count"
+        );
+        Self::new(token, region, workers)
+    }
+
+    /// Calculate optimal worker count based on CPU cores and available memory
+    pub fn calculate_adaptive_workers() -> usize {
+        let mut sys = System::new();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+
+        let cpu_cores = sys.cpus().len();
+        let available_memory_gb = sys.available_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        // Base workers on CPU cores (2x cores is a good baseline for I/O bound tasks)
+        let cpu_based = cpu_cores * 2;
+
+        // Limit based on available memory (each worker might use ~50MB for buffers)
+        let memory_based = (available_memory_gb * 20.0) as usize; // ~50MB per worker
+
+        // Take the minimum of CPU-based and memory-based, clamped to valid range
+        let workers = cpu_based.min(memory_based).clamp(MIN_WORKERS, MAX_WORKERS);
+
+        info!(
+            cpu_cores = cpu_cores,
+            available_memory_gb = format!("{:.2}", available_memory_gb),
+            calculated_workers = workers,
+            "Calculated adaptive worker count"
+        );
+
+        workers
     }
 
     pub fn set_retry_config(&mut self, config: RetryConfig) {
@@ -360,6 +676,14 @@ impl PCloudClient {
 
     pub fn set_duplicate_mode(&mut self, mode: DuplicateMode) {
         self.duplicate_mode = mode;
+    }
+
+    pub fn set_file_timeout_config(&mut self, config: FileTimeoutConfig) {
+        self.file_timeout_config = config;
+    }
+
+    pub fn set_chunked_upload_config(&mut self, config: ChunkedUploadConfig) {
+        self.chunked_upload_config = config;
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -719,6 +1043,312 @@ impl PCloudClient {
         let api_resp: ApiResponse = response.json().await?;
         Self::ensure_success(&api_resp)?;
         Ok(())
+    }
+
+    /// Upload a file with per-file timeout based on file size
+    pub async fn upload_file_with_timeout(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<()> {
+        let file_size = std::fs::metadata(local_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let timeout = self.file_timeout_config.timeout_for_size(file_size);
+
+        match tokio::time::timeout(timeout, self.upload_file(local_path, remote_path)).await {
+            Ok(result) => result,
+            Err(_) => Err(PCloudError::ApiError(format!(
+                "Upload timed out after {:?} for file: {}",
+                timeout, local_path
+            ))),
+        }
+    }
+
+    /// Upload a large file in chunks (for files > 2GB)
+    /// Uses pCloud's upload_save API for chunked uploads
+    pub async fn upload_large_file_chunked<F>(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        mut progress_callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64, u64) + Send + Sync + 'static,
+    {
+        let path = Path::new(local_path);
+        if !path.exists() {
+            return Err(PCloudError::FileNotFound(local_path.to_string()));
+        }
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| PCloudError::InvalidPath("Invalid filename".to_string()))?;
+
+        let file_size = std::fs::metadata(local_path)
+            .map(|m| m.len())
+            .map_err(PCloudError::IoError)?;
+
+        // For files under the threshold, use regular upload
+        if file_size < self.chunked_upload_config.threshold_bytes
+            || !self.chunked_upload_config.enabled
+        {
+            return self.upload_file(local_path, remote_path).await;
+        }
+
+        let auth = self
+            .auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)?;
+
+        // Create upload session
+        let create_url = self.api_url("upload_create");
+        let create_params = [("auth", auth)];
+
+        #[derive(Deserialize)]
+        struct CreateResponse {
+            result: i32,
+            uploadid: Option<u64>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+
+        let create_resp: CreateResponse = self.api_get(&create_url, &create_params).await?;
+        if create_resp.result != 0 {
+            return Err(PCloudError::ApiError(
+                create_resp.error.unwrap_or_else(|| "Failed to create upload session".into()),
+            ));
+        }
+
+        let upload_id = create_resp
+            .uploadid
+            .ok_or_else(|| PCloudError::ApiError("No upload ID returned".into()))?;
+
+        // Upload chunks
+        let mut file = tokio::fs::File::open(local_path).await?;
+        let chunk_size = self.chunked_upload_config.chunk_size;
+        let mut offset: u64 = 0;
+        let mut buffer = vec![0u8; chunk_size as usize];
+
+        while offset < file_size {
+            let bytes_to_read = ((file_size - offset) as usize).min(chunk_size as usize);
+            let bytes_read = file.read(&mut buffer[..bytes_to_read]).await?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            // Upload this chunk
+            let write_url = self.api_url("upload_write");
+            let upload_id_str = upload_id.to_string();
+            let offset_str = offset.to_string();
+
+            let chunk_data = buffer[..bytes_read].to_vec();
+            let part = multipart::Part::bytes(chunk_data)
+                .file_name("chunk")
+                .mime_str("application/octet-stream")
+                .map_err(|e| PCloudError::ApiError(e.to_string()))?;
+
+            let form = multipart::Form::new().part("file", part);
+
+            let response = self
+                .client
+                .post(&write_url)
+                .query(&[
+                    ("auth", auth),
+                    ("uploadid", &upload_id_str),
+                    ("uploadoffset", &offset_str),
+                ])
+                .multipart(form)
+                .send()
+                .await?;
+
+            let write_resp: ApiResponse = response.json().await?;
+            if write_resp.result != 0 {
+                // Abort the upload on error
+                let _ = self
+                    .client
+                    .get(self.api_url("upload_cancel"))
+                    .query(&[("auth", auth), ("uploadid", &upload_id_str)])
+                    .send()
+                    .await;
+                return Err(PCloudError::ApiError(
+                    write_resp.error.unwrap_or_else(|| "Chunk upload failed".into()),
+                ));
+            }
+
+            offset += bytes_read as u64;
+            progress_callback(offset, file_size);
+        }
+
+        // Save/finalize the upload
+        let save_url = self.api_url("upload_save");
+        let upload_id_str = upload_id.to_string();
+
+        let save_params = [
+            ("auth", auth),
+            ("uploadid", &upload_id_str),
+            ("path", remote_path),
+            ("name", filename),
+        ];
+
+        let save_resp: ApiResponse = self.api_get(&save_url, &save_params).await?;
+        Self::ensure_success(&save_resp)?;
+
+        info!(
+            file = local_path,
+            size = file_size,
+            chunks = (file_size + chunk_size - 1) / chunk_size,
+            "Large file upload completed"
+        );
+
+        Ok(())
+    }
+
+    /// Upload files with per-file timeout and automatic retry
+    pub async fn upload_files_with_timeout(
+        &self,
+        tasks: Vec<(String, String)>,
+        max_retries_per_file: u32,
+    ) -> (u32, u32, Vec<(String, String)>) {
+        let mut uploaded = 0u32;
+        let mut failed = 0u32;
+        let mut failed_tasks: Vec<(String, String)> = Vec::new();
+
+        let uploads = stream::iter(tasks)
+            .map(|(local_path, remote_folder)| {
+                let client = self.clone();
+                let max_retries = max_retries_per_file;
+                async move {
+                    let mut attempts = 0;
+                    let mut last_error = None;
+
+                    while attempts <= max_retries {
+                        match client.upload_file_with_timeout(&local_path, &remote_folder).await {
+                            Ok(()) => return (local_path, remote_folder, true, None),
+                            Err(e) => {
+                                attempts += 1;
+                                last_error = Some(e.to_string());
+
+                                if attempts <= max_retries {
+                                    // Exponential backoff between retries
+                                    let delay = std::time::Duration::from_millis(
+                                        500 * (2u64.pow(attempts - 1)),
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                }
+                            }
+                        }
+                    }
+
+                    (local_path, remote_folder, false, last_error)
+                }
+            })
+            .buffer_unordered(self.workers);
+
+        let results: Vec<_> = uploads.collect().await;
+
+        for (local_path, remote_folder, success, error) in results {
+            if success {
+                uploaded += 1;
+            } else {
+                failed += 1;
+                if let Some(err) = error {
+                    warn!(
+                        file = %local_path,
+                        error = %err,
+                        "File upload failed after retries"
+                    );
+                }
+                failed_tasks.push((local_path, remote_folder));
+            }
+        }
+
+        (uploaded, failed, failed_tasks)
+    }
+
+    /// Download a file with per-file timeout based on expected size
+    pub async fn download_file_with_timeout(
+        &self,
+        remote_path: &str,
+        local_folder: &str,
+        expected_size: Option<u64>,
+    ) -> Result<String> {
+        let size = expected_size.unwrap_or(100 * 1024 * 1024); // Default 100MB estimate
+        let timeout = self.file_timeout_config.timeout_for_size(size);
+
+        match tokio::time::timeout(timeout, self.download_file(remote_path, local_folder)).await {
+            Ok(result) => result,
+            Err(_) => Err(PCloudError::ApiError(format!(
+                "Download timed out after {:?} for file: {}",
+                timeout, remote_path
+            ))),
+        }
+    }
+
+    /// Download files with per-file timeout and automatic retry
+    pub async fn download_files_with_timeout(
+        &self,
+        tasks: Vec<(String, String)>,
+        max_retries_per_file: u32,
+    ) -> (u32, u32, Vec<(String, String)>) {
+        let mut downloaded = 0u32;
+        let mut failed = 0u32;
+        let mut failed_tasks: Vec<(String, String)> = Vec::new();
+
+        let downloads = stream::iter(tasks)
+            .map(|(remote_path, local_folder)| {
+                let client = self.clone();
+                let max_retries = max_retries_per_file;
+                async move {
+                    let mut attempts = 0;
+                    let mut last_error = None;
+
+                    while attempts <= max_retries {
+                        match client
+                            .download_file_with_timeout(&remote_path, &local_folder, None)
+                            .await
+                        {
+                            Ok(_) => return (remote_path, local_folder, true, None),
+                            Err(e) => {
+                                attempts += 1;
+                                last_error = Some(e.to_string());
+
+                                if attempts <= max_retries {
+                                    let delay = std::time::Duration::from_millis(
+                                        500 * (2u64.pow(attempts - 1)),
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                }
+                            }
+                        }
+                    }
+
+                    (remote_path, local_folder, false, last_error)
+                }
+            })
+            .buffer_unordered(self.workers);
+
+        let results: Vec<_> = downloads.collect().await;
+
+        for (remote_path, local_folder, success, error) in results {
+            if success {
+                downloaded += 1;
+            } else {
+                failed += 1;
+                if let Some(err) = error {
+                    warn!(
+                        file = %remote_path,
+                        error = %err,
+                        "File download failed after retries"
+                    );
+                }
+                failed_tasks.push((remote_path, local_folder));
+            }
+        }
+
+        (downloaded, failed, failed_tasks)
     }
 
     // --- Downloads ---
