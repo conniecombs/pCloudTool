@@ -341,7 +341,10 @@ impl TransferState {
         // Regenerate UUID if invalid
         if uuid::Uuid::parse_str(&self.id).is_err() {
             let new_id = uuid::Uuid::new_v4().to_string();
-            repairs.push(format!("Regenerated invalid state ID: {} -> {}", self.id, new_id));
+            repairs.push(format!(
+                "Regenerated invalid state ID: {} -> {}",
+                self.id, new_id
+            ));
             self.id = new_id;
         }
 
@@ -1051,9 +1054,7 @@ impl PCloudClient {
         local_path: &str,
         remote_path: &str,
     ) -> Result<()> {
-        let file_size = std::fs::metadata(local_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
         let timeout = self.file_timeout_config.timeout_for_size(file_size);
 
         match tokio::time::timeout(timeout, self.upload_file(local_path, remote_path)).await {
@@ -1117,7 +1118,9 @@ impl PCloudClient {
         let create_resp: CreateResponse = self.api_get(&create_url, &create_params).await?;
         if create_resp.result != 0 {
             return Err(PCloudError::ApiError(
-                create_resp.error.unwrap_or_else(|| "Failed to create upload session".into()),
+                create_resp
+                    .error
+                    .unwrap_or_else(|| "Failed to create upload session".into()),
             ));
         }
 
@@ -1174,7 +1177,9 @@ impl PCloudClient {
                     .send()
                     .await;
                 return Err(PCloudError::ApiError(
-                    write_resp.error.unwrap_or_else(|| "Chunk upload failed".into()),
+                    write_resp
+                        .error
+                        .unwrap_or_else(|| "Chunk upload failed".into()),
                 ));
             }
 
@@ -1225,7 +1230,10 @@ impl PCloudClient {
                     let mut last_error = None;
 
                     while attempts <= max_retries {
-                        match client.upload_file_with_timeout(&local_path, &remote_folder).await {
+                        match client
+                            .upload_file_with_timeout(&local_path, &remote_folder)
+                            .await
+                        {
                             Ok(()) => return (local_path, remote_folder, true, None),
                             Err(e) => {
                                 attempts += 1;
