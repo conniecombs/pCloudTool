@@ -15,6 +15,112 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Theme mode for light/dark appearance
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ThemeMode {
+    Light,
+    #[default]
+    Dark,
+}
+
+/// Windows Fluent-inspired color palette
+#[derive(Debug, Clone, Copy)]
+struct ThemeColors {
+    // Backgrounds
+    bg_base: Color,
+    bg_surface: Color,
+    bg_elevated: Color,
+    bg_hover: Color,
+    bg_selected: Color,
+
+    // Text
+    text_primary: Color,
+    text_secondary: Color,
+    text_disabled: Color,
+
+    // Accent (Windows blue)
+    accent: Color,
+    accent_hover: Color,
+    accent_pressed: Color,
+
+    // Borders
+    border: Color,
+    border_strong: Color,
+
+    // Status colors
+    success: Color,
+    warning: Color,
+    error: Color,
+
+    // Dividers
+    divider: Color,
+}
+
+impl ThemeColors {
+    fn dark() -> Self {
+        Self {
+            // Dark mode - Windows 11 inspired
+            bg_base: Color::from_rgb(0.12, 0.12, 0.12), // #1f1f1f
+            bg_surface: Color::from_rgb(0.16, 0.16, 0.16), // #292929
+            bg_elevated: Color::from_rgb(0.20, 0.20, 0.20), // #333333
+            bg_hover: Color::from_rgb(0.24, 0.24, 0.24), // #3d3d3d
+            bg_selected: Color::from_rgb(0.20, 0.30, 0.45), // Accent tinted
+
+            text_primary: Color::from_rgb(1.0, 1.0, 1.0),
+            text_secondary: Color::from_rgb(0.70, 0.70, 0.70),
+            text_disabled: Color::from_rgb(0.45, 0.45, 0.45),
+
+            accent: Color::from_rgb(0.38, 0.56, 0.89), // #60a0e4 Windows blue
+            accent_hover: Color::from_rgb(0.45, 0.63, 0.95),
+            accent_pressed: Color::from_rgb(0.30, 0.48, 0.78),
+
+            border: Color::from_rgb(0.28, 0.28, 0.28),
+            border_strong: Color::from_rgb(0.40, 0.40, 0.40),
+
+            success: Color::from_rgb(0.35, 0.75, 0.45),
+            warning: Color::from_rgb(0.95, 0.75, 0.30),
+            error: Color::from_rgb(0.90, 0.35, 0.35),
+
+            divider: Color::from_rgb(0.22, 0.22, 0.22),
+        }
+    }
+
+    fn light() -> Self {
+        Self {
+            // Light mode - Windows 11 inspired
+            bg_base: Color::from_rgb(0.98, 0.98, 0.98), // #fafafa
+            bg_surface: Color::from_rgb(1.0, 1.0, 1.0), // #ffffff
+            bg_elevated: Color::from_rgb(0.96, 0.96, 0.96), // #f5f5f5
+            bg_hover: Color::from_rgb(0.92, 0.92, 0.92), // #ebebeb
+            bg_selected: Color::from_rgb(0.85, 0.91, 0.98), // Accent tinted
+
+            text_primary: Color::from_rgb(0.10, 0.10, 0.10),
+            text_secondary: Color::from_rgb(0.40, 0.40, 0.40),
+            text_disabled: Color::from_rgb(0.60, 0.60, 0.60),
+
+            accent: Color::from_rgb(0.00, 0.47, 0.84), // #0078d4 Windows blue
+            accent_hover: Color::from_rgb(0.10, 0.53, 0.90),
+            accent_pressed: Color::from_rgb(0.00, 0.40, 0.72),
+
+            border: Color::from_rgb(0.85, 0.85, 0.85),
+            border_strong: Color::from_rgb(0.70, 0.70, 0.70),
+
+            success: Color::from_rgb(0.15, 0.60, 0.30),
+            warning: Color::from_rgb(0.80, 0.60, 0.10),
+            error: Color::from_rgb(0.80, 0.20, 0.20),
+
+            divider: Color::from_rgb(0.90, 0.90, 0.90),
+        }
+    }
+
+    fn for_mode(mode: ThemeMode) -> Self {
+        match mode {
+            ThemeMode::Light => Self::light(),
+            ThemeMode::Dark => Self::dark(),
+        }
+    }
+}
+
 /// Context menu state for right-click operations
 #[derive(Debug, Clone)]
 struct ContextMenu {
@@ -103,6 +209,8 @@ struct PCloudGui {
     account_info: Option<AccountInfo>,
     // Duplicate mode setting
     duplicate_mode: DuplicateMode,
+    // Theme mode (light/dark)
+    theme_mode: ThemeMode,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +479,7 @@ enum Message {
     // Settings
     ToggleAdaptiveConcurrency(bool),
     DuplicateModeChanged(DuplicateMode),
+    ToggleTheme,
 }
 
 /// State for creating a new folder
@@ -409,13 +518,22 @@ impl PCloudGui {
                 create_folder_state: CreateFolderState::default(),
                 account_info: None,
                 duplicate_mode: DuplicateMode::Rename,
+                theme_mode: ThemeMode::Dark,
             },
             Task::none(),
         )
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        match self.theme_mode {
+            ThemeMode::Light => Theme::Light,
+            ThemeMode::Dark => Theme::Dark,
+        }
+    }
+
+    /// Get current theme colors
+    fn colors(&self) -> ThemeColors {
+        ThemeColors::for_mode(self.theme_mode)
     }
 
     fn is_busy(&self) -> bool {
@@ -1107,6 +1225,13 @@ impl PCloudGui {
                 self.client.set_duplicate_mode(mode);
                 Task::none()
             }
+            Message::ToggleTheme => {
+                self.theme_mode = match self.theme_mode {
+                    ThemeMode::Light => ThemeMode::Dark,
+                    ThemeMode::Dark => ThemeMode::Light,
+                };
+                Task::none()
+            }
         }
     }
 
@@ -1176,37 +1301,45 @@ impl PCloudGui {
     }
 
     fn view_create_folder_dialog(&self) -> Element<'_, Message> {
+        let colors = self.colors();
         container(
             column![
-                text("Create New Folder").size(16),
+                text("Create New Folder")
+                    .size(16)
+                    .color(colors.text_primary),
                 Space::with_height(15),
                 text_input("Folder name", &self.create_folder_state.name)
                     .on_input(Message::CreateFolderNameChanged)
                     .on_submit(Message::CreateFolderConfirmed)
                     .padding(10)
-                    .style(style_input),
+                    .style(make_input_style(colors)),
                 Space::with_height(15),
                 row![
                     button(text("Cancel").align_x(alignment::Horizontal::Center))
                         .padding([8, 20])
-                        .style(style_secondary)
+                        .style(make_secondary_style(colors))
                         .on_press(Message::CancelCreateFolder),
                     Space::with_width(10),
                     button(text("Create").align_x(alignment::Horizontal::Center))
                         .padding([8, 20])
-                        .style(style_primary)
+                        .style(make_primary_style(colors))
                         .on_press(Message::CreateFolderConfirmed),
                 ]
             ]
             .padding(20)
             .width(300),
         )
-        .style(|_| container::Style {
-            background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
+        .style(move |_| container::Style {
+            background: Some(colors.bg_elevated.into()),
             border: iced::Border {
-                color: Color::from_rgb(0.3, 0.3, 0.3),
+                color: colors.border,
                 width: 1.0,
                 radius: 8.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.3),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 12.0,
             },
             ..Default::default()
         })
@@ -1214,6 +1347,7 @@ impl PCloudGui {
     }
 
     fn view_context_menu(&self, menu: &ContextMenu) -> Element<'_, Message> {
+        let colors = self.colors();
         let mut menu_items: Vec<Element<'_, Message>> = Vec::new();
 
         // Show item name if selected
@@ -1227,7 +1361,7 @@ impl PCloudGui {
             menu_items.push(
                 text(format!("{} {}", icon, name))
                     .size(12)
-                    .color(Color::from_rgb(0.7, 0.7, 0.7))
+                    .color(colors.text_secondary)
                     .into(),
             );
             menu_items.push(Space::with_height(8).into());
@@ -1237,7 +1371,7 @@ impl PCloudGui {
                     button(text("📂 Open Folder").size(12))
                         .width(Length::Fill)
                         .padding([8, 15])
-                        .style(style_context_menu_item)
+                        .style(make_context_menu_item_style(colors))
                         .on_press(Message::ContextMenuOpen)
                         .into(),
                 );
@@ -1246,7 +1380,7 @@ impl PCloudGui {
                 button(text("⬇️ Download").size(12))
                     .width(Length::Fill)
                     .padding([8, 15])
-                    .style(style_context_menu_item)
+                    .style(make_context_menu_item_style(colors))
                     .on_press(Message::ContextMenuDownload)
                     .into(),
             );
@@ -1254,7 +1388,7 @@ impl PCloudGui {
                 button(text("🗑️ Delete").size(12))
                     .width(Length::Fill)
                     .padding([8, 15])
-                    .style(style_context_menu_item)
+                    .style(make_context_menu_item_style(colors))
                     .on_press(Message::ContextMenuDelete)
                     .into(),
             );
@@ -1265,7 +1399,7 @@ impl PCloudGui {
             button(text("📁 New Folder").size(12))
                 .width(Length::Fill)
                 .padding([8, 15])
-                .style(style_context_menu_item)
+                .style(make_context_menu_item_style(colors))
                 .on_press(Message::ContextMenuNewFolder)
                 .into(),
         );
@@ -1279,16 +1413,16 @@ impl PCloudGui {
             )
             .width(Length::Fill)
             .padding([8, 15])
-            .style(style_secondary)
+            .style(make_secondary_style(colors))
             .on_press(Message::HideContextMenu)
             .into(),
         );
 
         container(column(menu_items).width(200).padding(10))
-            .style(|_| container::Style {
-                background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
+            .style(move |_| container::Style {
+                background: Some(colors.bg_elevated.into()),
                 border: iced::Border {
-                    color: Color::from_rgb(0.35, 0.35, 0.35),
+                    color: colors.border_strong,
                     width: 1.0,
                     radius: 8.0.into(),
                 },
@@ -1303,54 +1437,70 @@ impl PCloudGui {
     }
 
     fn view_login(&self) -> Element<'_, Message> {
+        let colors = self.colors();
+        let theme_icon = if self.theme_mode == ThemeMode::Dark {
+            "🌙"
+        } else {
+            "☀️"
+        };
+
         container(
             column![
+                // Theme toggle in top-right
+                row![
+                    horizontal_space(),
+                    button(text(theme_icon).size(16))
+                        .padding([6, 10])
+                        .style(make_theme_toggle_style(colors))
+                        .on_press(Message::ToggleTheme),
+                ]
+                .width(Length::Fill),
+                Space::with_height(40),
                 text("☁️ pCloud Fast Transfer")
                     .size(30)
-                    .color(Color::from_rgb(0.2, 0.6, 1.0)),
+                    .color(colors.accent),
                 Space::with_height(20),
                 text_input("Email", &self.username)
                     .on_input(Message::UsernameChanged)
                     .padding(10)
-                    .style(style_input),
+                    .style(make_input_style(colors)),
                 text_input("Password", &self.password)
                     .on_input(Message::PasswordChanged)
                     .padding(10)
                     .secure(true)
-                    .style(style_input),
+                    .style(make_input_style(colors)),
                 Space::with_height(20),
                 button(text("Login").align_x(alignment::Horizontal::Center))
                     .on_press(Message::LoginPressed)
                     .width(Length::Fill)
                     .padding(10)
-                    .style(style_primary)
+                    .style(make_primary_style(colors))
             ]
-            .width(300)
+            .width(320)
             .align_x(Alignment::Center),
         )
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .style(|_| container::Style {
-            background: Some(Color::from_rgb(0.1, 0.1, 0.1).into()),
+        .style(move |_| container::Style {
+            background: Some(colors.bg_base.into()),
             ..Default::default()
         })
         .into()
     }
 
     fn view_sidebar(&self) -> Element<'_, Message> {
+        let colors = self.colors();
         let is_busy = self.is_busy();
-        let btn = |l, m| {
-            let b = button(text(l).align_x(alignment::Horizontal::Center))
-                .width(Length::Fill)
-                .padding(10)
-                .style(style_primary);
-            if !is_busy {
-                b.on_press(m)
-            } else {
-                b
-            }
+
+        let primary_style = make_primary_style(colors);
+
+        // Theme toggle
+        let theme_icon = if self.theme_mode == ThemeMode::Dark {
+            "🌙"
+        } else {
+            "☀️"
         };
 
         // Account quota display
@@ -1359,21 +1509,19 @@ impl PCloudGui {
             let total_gb = info.quota as f64 / (1024.0 * 1024.0 * 1024.0);
             let pct = info.usage_percent();
             let bar_color = if pct > 90.0 {
-                Color::from_rgb(0.9, 0.3, 0.3)
+                colors.error
             } else if pct > 75.0 {
-                Color::from_rgb(0.9, 0.7, 0.3)
+                colors.warning
             } else {
-                Color::from_rgb(0.3, 0.7, 0.4)
+                colors.success
             };
             column![
-                text("Storage")
-                    .size(12)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                text("Storage").size(12).color(colors.text_secondary),
                 Space::with_height(5),
                 progress_bar(0.0..=100.0, pct as f32)
                     .height(6)
                     .style(move |_| progress_bar::Style {
-                        background: Background::Color(Color::from_rgb(0.2, 0.2, 0.2)),
+                        background: Background::Color(colors.bg_elevated),
                         bar: Background::Color(bar_color),
                         border: iced::Border {
                             radius: 3.0.into(),
@@ -1383,7 +1531,7 @@ impl PCloudGui {
                 Space::with_height(3),
                 text(format!("{:.1} / {:.1} GB ({:.0}%)", used_gb, total_gb, pct))
                     .size(10)
-                    .color(Color::from_rgb(0.6, 0.6, 0.6)),
+                    .color(colors.text_disabled),
                 Space::with_height(15),
             ]
             .into()
@@ -1395,29 +1543,26 @@ impl PCloudGui {
         let dup_mode_btns = row![
             button(text("Skip").size(10))
                 .padding([4, 8])
-                .style(if self.duplicate_mode == DuplicateMode::Skip {
-                    style_sort_active
-                } else {
-                    style_sort_inactive
-                })
+                .style(make_toggle_btn_style(
+                    colors,
+                    self.duplicate_mode == DuplicateMode::Skip
+                ))
                 .on_press(Message::DuplicateModeChanged(DuplicateMode::Skip)),
             Space::with_width(4),
             button(text("Rename").size(10))
                 .padding([4, 8])
-                .style(if self.duplicate_mode == DuplicateMode::Rename {
-                    style_sort_active
-                } else {
-                    style_sort_inactive
-                })
+                .style(make_toggle_btn_style(
+                    colors,
+                    self.duplicate_mode == DuplicateMode::Rename
+                ))
                 .on_press(Message::DuplicateModeChanged(DuplicateMode::Rename)),
             Space::with_width(4),
             button(text("Overwrite").size(10))
                 .padding([4, 8])
-                .style(if self.duplicate_mode == DuplicateMode::Overwrite {
-                    style_sort_active
-                } else {
-                    style_sort_inactive
-                })
+                .style(make_toggle_btn_style(
+                    colors,
+                    self.duplicate_mode == DuplicateMode::Overwrite
+                ))
                 .on_press(Message::DuplicateModeChanged(DuplicateMode::Overwrite)),
         ];
 
@@ -1431,11 +1576,7 @@ impl PCloudGui {
             .size(10)
         )
         .padding([4, 8])
-        .style(if self.use_adaptive_concurrency {
-            style_sort_active
-        } else {
-            style_sort_inactive
-        })
+        .style(make_toggle_btn_style(colors, self.use_adaptive_concurrency))
         .on_press(Message::ToggleAdaptiveConcurrency(
             !self.use_adaptive_concurrency
         )),];
@@ -1444,51 +1585,90 @@ impl PCloudGui {
         let shortcuts_help = column![
             text("Keyboard Shortcuts")
                 .size(11)
-                .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                .color(colors.text_secondary),
             Space::with_height(5),
             text("Ctrl+U  Upload files")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             text("Ctrl+D  Download")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             text("Ctrl+N  New folder")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             text("Ctrl+R / F5  Refresh")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             text("Enter  Open folder")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             text("Backspace  Go up")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             text("Delete  Delete item")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             text("Escape  Cancel/Clear")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
             Space::with_height(5),
             text("Right-click for menu")
                 .size(10)
-                .color(Color::from_rgb(0.45, 0.45, 0.45)),
+                .color(colors.text_disabled),
         ]
         .spacing(2);
 
         let sidebar_content = scrollable(
             column![
+                // Theme toggle at top
+                row![
+                    text("Theme").size(12).color(colors.text_secondary),
+                    horizontal_space(),
+                    button(text(theme_icon).size(14))
+                        .padding([4, 8])
+                        .style(make_theme_toggle_style(colors))
+                        .on_press(Message::ToggleTheme),
+                ]
+                .align_y(Alignment::Center),
+                Space::with_height(15),
                 quota_display,
-                text("Actions")
-                    .size(12)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                text("Actions").size(12).color(colors.text_secondary),
                 Space::with_height(10),
-                btn("⬆️ Upload Files", Message::UploadFilePressed),
+                {
+                    let b = button(text("⬆️ Upload Files").align_x(alignment::Horizontal::Center))
+                        .width(Length::Fill)
+                        .padding(10)
+                        .style(primary_style);
+                    if !is_busy {
+                        b.on_press(Message::UploadFilePressed)
+                    } else {
+                        b
+                    }
+                },
                 Space::with_height(5),
-                btn("⬆️ Upload Folder", Message::UploadFolderPressed),
+                {
+                    let b = button(text("⬆️ Upload Folder").align_x(alignment::Horizontal::Center))
+                        .width(Length::Fill)
+                        .padding(10)
+                        .style(make_primary_style(colors));
+                    if !is_busy {
+                        b.on_press(Message::UploadFolderPressed)
+                    } else {
+                        b
+                    }
+                },
                 Space::with_height(20),
-                btn("⬇️ Download", Message::DownloadPressed),
+                {
+                    let b = button(text("⬇️ Download").align_x(alignment::Horizontal::Center))
+                        .width(Length::Fill)
+                        .padding(10)
+                        .style(make_primary_style(colors));
+                    if !is_busy {
+                        b.on_press(Message::DownloadPressed)
+                    } else {
+                        b
+                    }
+                },
                 Space::with_height(5),
                 {
                     let is_confirming =
@@ -1503,14 +1683,11 @@ impl PCloudGui {
                     } else {
                         Message::DeletePressed
                     };
+                    let btn_style = make_delete_btn_style(colors, is_confirming);
                     let b = button(text(label).align_x(alignment::Horizontal::Center))
                         .width(Length::Fill)
                         .padding(10)
-                        .style(if is_confirming {
-                            style_danger
-                        } else {
-                            style_secondary
-                        });
+                        .style(btn_style);
                     if !is_busy {
                         b.on_press(msg)
                     } else {
@@ -1522,7 +1699,7 @@ impl PCloudGui {
                     let b = button(text("📁 New Folder").align_x(alignment::Horizontal::Center))
                         .width(Length::Fill)
                         .padding(10)
-                        .style(style_secondary);
+                        .style(make_secondary_style(colors));
                     if !is_busy {
                         b.on_press(Message::CreateFolderPressed)
                     } else {
@@ -1530,16 +1707,14 @@ impl PCloudGui {
                     }
                 },
                 Space::with_height(20),
-                text("Duplicates")
-                    .size(12)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                text("Duplicates").size(12).color(colors.text_secondary),
                 Space::with_height(5),
                 dup_mode_btns,
                 Space::with_height(20),
                 row![
                     text(format!("Threads: {}", self.concurrency_setting))
                         .size(12)
-                        .color(Color::from_rgb(0.7, 0.7, 0.7)),
+                        .color(colors.text_secondary),
                     horizontal_space(),
                     adaptive_toggle,
                 ]
@@ -1557,20 +1732,18 @@ impl PCloudGui {
                     Element::from(Space::with_height(0))
                 },
                 Space::with_height(20),
-                text("Navigation")
-                    .size(12)
-                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                text("Navigation").size(12).color(colors.text_secondary),
                 Space::with_height(10),
                 button(text("⬅ Go Up"))
                     .width(Length::Fill)
                     .padding(8)
-                    .style(style_secondary)
+                    .style(make_secondary_style(colors))
                     .on_press(Message::NavigateUp),
                 Space::with_height(5),
                 button(text("🔄 Refresh"))
                     .width(Length::Fill)
                     .padding(8)
-                    .style(style_secondary)
+                    .style(make_secondary_style(colors))
                     .on_press(Message::RefreshList),
                 Space::with_height(20),
                 shortcuts_help,
@@ -1580,8 +1753,8 @@ impl PCloudGui {
 
         container(sidebar_content)
             .padding(20)
-            .style(|_| container::Style {
-                background: Some(Color::from_rgb(0.12, 0.12, 0.12).into()),
+            .style(move |_| container::Style {
+                background: Some(colors.bg_surface.into()),
                 ..Default::default()
             })
             .height(Length::Fill)
@@ -1589,6 +1762,7 @@ impl PCloudGui {
     }
 
     fn view_file_list(&self) -> Element<'_, Message> {
+        let colors = self.colors();
         let filter_lower = self.search_filter.to_lowercase();
         // Deref Arc
         let filtered_items: Vec<FileItem> = if self.search_filter.is_empty() {
@@ -1634,11 +1808,11 @@ impl PCloudGui {
                     let row_c = row![
                         text(icon),
                         Space::with_width(10),
-                        text(item.name.clone()),
+                        text(item.name.clone()).color(colors.text_primary),
                         horizontal_space(),
                         text(format_bytes(size))
                             .size(12)
-                            .color(Color::from_rgb(0.7, 0.7, 0.7))
+                            .color(colors.text_secondary)
                     ]
                     .align_y(Alignment::Center)
                     .padding(10);
@@ -1646,20 +1820,7 @@ impl PCloudGui {
                     // Wrap button in mouse_area for right-click detection
                     let btn = button(row_c)
                         .width(Length::Fill)
-                        .style(move |_, s| {
-                            let bg = if is_sel {
-                                Color::from_rgb(0.2, 0.3, 0.5)
-                            } else if s == button::Status::Hovered {
-                                Color::from_rgb(0.2, 0.2, 0.2)
-                            } else {
-                                Color::TRANSPARENT
-                            };
-                            button::Style {
-                                background: Some(bg.into()),
-                                text_color: Color::WHITE,
-                                ..Default::default()
-                            }
-                        })
+                        .style(make_file_item_style(colors, is_sel))
                         // Single click selects, double-click handled by ItemClicked
                         .on_press(Message::ItemClicked(item_clone));
 
@@ -1679,16 +1840,19 @@ impl PCloudGui {
     }
 
     fn view_header(&self) -> Element<'_, Message> {
+        let colors = self.colors();
         let breadcrumbs = self.view_breadcrumbs();
         let sort_controls = self.view_sort_controls();
         column![
             row![
                 breadcrumbs,
                 horizontal_space(),
-                text(format!("👤 {}", self.username)).size(14),
+                text(format!("👤 {}", self.username))
+                    .size(14)
+                    .color(colors.text_primary),
                 Space::with_width(20),
                 button(text("Logout").size(12))
-                    .style(style_secondary)
+                    .style(make_secondary_style(colors))
                     .on_press(Message::LogoutPressed)
                     .padding([5, 10])
             ]
@@ -1701,10 +1865,11 @@ impl PCloudGui {
     }
 
     fn view_breadcrumbs(&self) -> Element<'_, Message> {
+        let colors = self.colors();
         let mut breadcrumb_row = row![].spacing(2).align_y(Alignment::Center);
         breadcrumb_row = breadcrumb_row.push(
             button(text("🏠").size(14))
-                .style(style_breadcrumb)
+                .style(make_breadcrumb_style(colors))
                 .padding([2, 6])
                 .on_press(Message::NavigateToPath("/".to_string())),
         );
@@ -1721,15 +1886,15 @@ impl PCloudGui {
                 accumulated_path = format!("{}/{}", accumulated_path, part);
                 let path_clone = accumulated_path.clone();
                 breadcrumb_row =
-                    breadcrumb_row.push(text("/").size(14).color(Color::from_rgb(0.5, 0.5, 0.5)));
+                    breadcrumb_row.push(text("/").size(14).color(colors.text_disabled));
 
                 if i == parts.len() - 1 {
-                    breadcrumb_row = breadcrumb_row
-                        .push(text(*part).size(14).color(Color::from_rgb(0.8, 0.8, 0.8)));
+                    breadcrumb_row =
+                        breadcrumb_row.push(text(*part).size(14).color(colors.text_primary));
                 } else {
                     breadcrumb_row = breadcrumb_row.push(
                         button(text(*part).size(14))
-                            .style(style_breadcrumb)
+                            .style(make_breadcrumb_style(colors))
                             .padding([2, 6])
                             .on_press(Message::NavigateToPath(path_clone)),
                     );
@@ -1740,57 +1905,55 @@ impl PCloudGui {
     }
 
     fn view_sort_controls(&self) -> Element<'_, Message> {
+        let colors = self.colors();
         let sort_indicator = match self.sort_order {
             SortOrder::Ascending => "▲",
             SortOrder::Descending => "▼",
         };
-        let sort_btn = |label: &str, sort_by: SortBy| {
-            let is_active = self.sort_by == sort_by;
+        let sort_btn = |label: &str, sort_by: SortBy, colors: ThemeColors, current: SortBy| {
+            let is_active = current == sort_by;
             let display = if is_active {
                 format!("{} {}", label, sort_indicator)
             } else {
                 label.to_string()
             };
             button(text(display).size(11))
-                .style(if is_active {
-                    style_sort_active
-                } else {
-                    style_sort_inactive
-                })
+                .style(make_toggle_btn_style(colors, is_active))
                 .padding([3, 8])
                 .on_press(Message::SortByChanged(sort_by))
         };
 
         let search_input = row![
-            text("🔍").size(12),
+            text("🔍").size(12).color(colors.text_secondary),
             Space::with_width(4),
             text_input("Filter files...", &self.search_filter)
                 .on_input(Message::SearchFilterChanged)
                 .padding(4)
                 .size(12)
                 .width(Length::Fixed(150.0))
-                .style(style_search_input),
+                .style(make_search_input_style(colors)),
             if !self.search_filter.is_empty() {
                 button(text("✕").size(10))
-                    .style(style_clear_btn)
+                    .style(make_clear_btn_style(colors))
                     .padding([2, 6])
                     .on_press(Message::ClearSearchFilter)
             } else {
                 button(text("").size(10))
-                    .style(style_clear_btn)
+                    .style(make_clear_btn_style(colors))
                     .padding([2, 6])
             }
         ]
         .align_y(Alignment::Center);
 
+        let current_sort = self.sort_by;
         row![
-            text("Sort:").size(11).color(Color::from_rgb(0.5, 0.5, 0.5)),
+            text("Sort:").size(11).color(colors.text_secondary),
             Space::with_width(8),
-            sort_btn("Name", SortBy::Name),
+            sort_btn("Name", SortBy::Name, colors, current_sort),
             Space::with_width(4),
-            sort_btn("Size", SortBy::Size),
+            sort_btn("Size", SortBy::Size, colors, current_sort),
             Space::with_width(4),
-            sort_btn("Date", SortBy::Date),
+            sort_btn("Date", SortBy::Date, colors, current_sort),
             horizontal_space(),
             search_input,
         ]
@@ -1800,29 +1963,31 @@ impl PCloudGui {
     }
 
     fn view_status_bar(&self) -> Element<'_, Message> {
+        let colors = self.colors();
         let content = match &self.status {
-            Status::Idle => row![text("Ready").size(12)],
-            Status::Working(s) => row![text(s).size(12).color(Color::from_rgb(0.4, 0.8, 1.0))],
-            Status::Success(s) => row![text(s).size(12).color(Color::from_rgb(0.4, 1.0, 0.4))],
-            Status::Error(s) => row![text(format!("Error: {}", s))
-                .size(12)
-                .color(Color::from_rgb(1.0, 0.4, 0.4))],
+            Status::Idle => row![text("Ready").size(12).color(colors.text_secondary)],
+            Status::Working(s) => row![text(s).size(12).color(colors.accent)],
+            Status::Success(s) => row![text(s).size(12).color(colors.success)],
+            Status::Error(s) => {
+                row![text(format!("Error: {}", s)).size(12).color(colors.error)]
+            }
             Status::ReadyToUpload(count, bytes) => row![
                 text(format!(
                     "Selected {} files ({})",
                     count,
                     format_bytes(*bytes)
                 ))
-                .size(12),
+                .size(12)
+                .color(colors.text_primary),
                 horizontal_space(),
                 button(text("Start Transfer").size(12))
                     .padding([5, 15])
-                    .style(style_primary)
+                    .style(make_primary_style(colors))
                     .on_press(Message::StartTransferPressed),
                 Space::with_width(10),
                 button(text("Cancel").size(12))
                     .padding([5, 10])
-                    .style(style_secondary)
+                    .style(make_secondary_style(colors))
                     .on_press(Message::CancelTransferPressed),
             ]
             .align_y(Alignment::Center),
@@ -1855,13 +2020,14 @@ impl PCloudGui {
                         progress_bar(0.0..=100.0, pct)
                             .height(8)
                             .width(Length::Fixed(200.0))
-                            .style(style_bar),
+                            .style(make_bar_style(colors)),
                         Space::with_width(10),
                         text(format!(
                             "{}/{} files • {:.1}%",
                             p.finished_files, p.total_files, pct
                         ))
                         .size(11)
+                        .color(colors.text_primary)
                     ]
                     .align_y(Alignment::Center),
                     row![text(format!(
@@ -1872,7 +2038,7 @@ impl PCloudGui {
                         p.current_speed / 1_000_000.0
                     ))
                     .size(10)
-                    .color(Color::from_rgb(0.6, 0.6, 0.6))]
+                    .color(colors.text_secondary)]
                 ]
                 .spacing(2)]
                 .align_y(Alignment::Center)
@@ -1880,8 +2046,13 @@ impl PCloudGui {
         };
         container(content)
             .padding(10)
-            .style(|_| container::Style {
-                background: Some(Color::from_rgb(0.08, 0.08, 0.08).into()),
+            .style(move |_| container::Style {
+                background: Some(colors.bg_base.into()),
+                border: iced::Border {
+                    color: colors.divider,
+                    width: 1.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .width(Length::Fill)
@@ -1912,197 +2083,342 @@ fn format_bytes(b: u64) -> String {
 
     format!("{:.1} {}", value, UNITS[unit_index])
 }
-fn style_input(_: &Theme, _: text_input::Status) -> text_input::Style {
-    text_input::Style {
-        background: Background::Color(Color::from_rgb(0.15, 0.15, 0.15)),
+// ============================================================================
+// Theme-aware style functions - Windows Fluent Design inspired
+// ============================================================================
+
+/// Creates a style function for text inputs
+fn make_input_style(
+    colors: ThemeColors,
+) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |_, _| text_input::Style {
+        background: Background::Color(colors.bg_surface),
         border: iced::Border {
-            color: Color::from_rgb(0.3, 0.3, 0.3),
+            color: colors.border,
             width: 1.0,
             radius: 4.0.into(),
         },
-        icon: Color::WHITE,
-        placeholder: Color::from_rgb(0.4, 0.4, 0.4),
-        value: Color::WHITE,
-        selection: Color::from_rgb(0.2, 0.4, 0.8),
+        icon: colors.text_primary,
+        placeholder: colors.text_disabled,
+        value: colors.text_primary,
+        selection: colors.accent,
     }
 }
-fn style_primary(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::from_rgb(0.0, 0.47, 0.95).into()),
-        text_color: Color::WHITE,
-        border: iced::Border {
-            radius: 4.0.into(),
+
+/// Creates a style function for primary buttons (accent colored)
+fn make_primary_style(colors: ThemeColors) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        let base = button::Style {
+            background: Some(colors.accent.into()),
+            text_color: Color::WHITE,
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgb(0.1, 0.55, 1.0).into()),
-            ..b
-        },
-        button::Status::Pressed => button::Style {
-            background: Some(Color::from_rgb(0.0, 0.4, 0.8).into()),
-            ..b
-        },
-        _ => b,
+        };
+        match s {
+            button::Status::Hovered => button::Style {
+                background: Some(colors.accent_hover.into()),
+                ..base
+            },
+            button::Status::Pressed => button::Style {
+                background: Some(colors.accent_pressed.into()),
+                ..base
+            },
+            _ => base,
+        }
     }
 }
-fn style_secondary(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::from_rgb(0.2, 0.2, 0.2).into()),
-        text_color: Color::WHITE,
-        border: iced::Border {
-            radius: 4.0.into(),
+
+/// Creates a style function for secondary buttons
+fn make_secondary_style(colors: ThemeColors) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        let base = button::Style {
+            background: Some(colors.bg_elevated.into()),
+            text_color: colors.text_primary,
+            border: iced::Border {
+                color: colors.border,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgb(0.25, 0.25, 0.25).into()),
-            ..b
-        },
-        _ => b,
+        };
+        match s {
+            button::Status::Hovered => button::Style {
+                background: Some(colors.bg_hover.into()),
+                ..base
+            },
+            button::Status::Pressed => button::Style {
+                background: Some(colors.bg_selected.into()),
+                ..base
+            },
+            _ => base,
+        }
     }
 }
-fn style_danger(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::from_rgb(0.7, 0.2, 0.2).into()),
-        text_color: Color::WHITE,
-        border: iced::Border {
-            radius: 4.0.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgb(0.85, 0.25, 0.25).into()),
-            ..b
-        },
-        button::Status::Pressed => button::Style {
-            background: Some(Color::from_rgb(0.6, 0.15, 0.15).into()),
-            ..b
-        },
-        _ => b,
+
+/// Creates a style function for delete button (danger or secondary based on confirmation state)
+fn make_delete_btn_style(
+    colors: ThemeColors,
+    is_confirming: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        if is_confirming {
+            // Danger style
+            let base = button::Style {
+                background: Some(colors.error.into()),
+                text_color: Color::WHITE,
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let error_hover = Color::from_rgba(
+                (colors.error.r * 1.15).min(1.0),
+                (colors.error.g * 1.15).min(1.0),
+                (colors.error.b * 1.15).min(1.0),
+                1.0,
+            );
+            let error_pressed = Color::from_rgba(
+                colors.error.r * 0.85,
+                colors.error.g * 0.85,
+                colors.error.b * 0.85,
+                1.0,
+            );
+            match s {
+                button::Status::Hovered => button::Style {
+                    background: Some(error_hover.into()),
+                    ..base
+                },
+                button::Status::Pressed => button::Style {
+                    background: Some(error_pressed.into()),
+                    ..base
+                },
+                _ => base,
+            }
+        } else {
+            // Secondary style
+            let base = button::Style {
+                background: Some(colors.bg_elevated.into()),
+                text_color: colors.text_primary,
+                border: iced::Border {
+                    color: colors.border,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            };
+            match s {
+                button::Status::Hovered => button::Style {
+                    background: Some(colors.bg_hover.into()),
+                    ..base
+                },
+                button::Status::Pressed => button::Style {
+                    background: Some(colors.bg_selected.into()),
+                    ..base
+                },
+                _ => base,
+            }
+        }
     }
 }
-fn style_bar(_: &Theme) -> progress_bar::Style {
-    progress_bar::Style {
-        background: Background::Color(Color::from_rgb(0.2, 0.2, 0.2)),
-        bar: Background::Color(Color::from_rgb(0.0, 0.47, 0.95)),
+
+/// Creates a style function for progress bars
+fn make_bar_style(colors: ThemeColors) -> impl Fn(&Theme) -> progress_bar::Style {
+    move |_| progress_bar::Style {
+        background: Background::Color(colors.bg_elevated),
+        bar: Background::Color(colors.accent),
         border: iced::Border {
             radius: 2.0.into(),
             ..Default::default()
         },
     }
 }
-fn style_breadcrumb(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::TRANSPARENT.into()),
-        text_color: Color::from_rgb(0.4, 0.7, 1.0),
-        border: iced::Border::default(),
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgb(0.2, 0.2, 0.25).into()),
-            text_color: Color::from_rgb(0.5, 0.8, 1.0),
-            border: iced::Border {
-                radius: 3.0.into(),
-                ..Default::default()
+
+/// Creates a style function for breadcrumb buttons
+fn make_breadcrumb_style(colors: ThemeColors) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        let base = button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            text_color: colors.accent,
+            border: iced::Border::default(),
+            ..Default::default()
+        };
+        match s {
+            button::Status::Hovered => button::Style {
+                background: Some(colors.bg_hover.into()),
+                text_color: colors.accent_hover,
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
+                ..base
             },
-            ..b
-        },
-        _ => b,
-    }
-}
-fn style_sort_active(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::from_rgb(0.2, 0.35, 0.5).into()),
-        text_color: Color::WHITE,
-        border: iced::Border {
-            radius: 3.0.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgb(0.25, 0.4, 0.55).into()),
-            ..b
-        },
-        _ => b,
-    }
-}
-fn style_sort_inactive(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::from_rgb(0.15, 0.15, 0.15).into()),
-        text_color: Color::from_rgb(0.6, 0.6, 0.6),
-        border: iced::Border {
-            radius: 3.0.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgb(0.2, 0.2, 0.2).into()),
-            text_color: Color::from_rgb(0.8, 0.8, 0.8),
-            ..b
-        },
-        _ => b,
-    }
-}
-fn style_search_input(_: &Theme, _: text_input::Status) -> text_input::Style {
-    text_input::Style {
-        background: Background::Color(Color::from_rgb(0.12, 0.12, 0.12)),
-        border: iced::Border {
-            color: Color::from_rgb(0.25, 0.25, 0.25),
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        icon: Color::WHITE,
-        placeholder: Color::from_rgb(0.4, 0.4, 0.4),
-        value: Color::WHITE,
-        selection: Color::from_rgb(0.2, 0.4, 0.8),
-    }
-}
-fn style_clear_btn(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::TRANSPARENT.into()),
-        text_color: Color::from_rgb(0.5, 0.5, 0.5),
-        border: iced::Border::default(),
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            text_color: Color::from_rgb(0.8, 0.3, 0.3),
-            ..b
-        },
-        _ => b,
+            _ => base,
+        }
     }
 }
 
-fn style_context_menu_item(_: &Theme, s: button::Status) -> button::Style {
-    let b = button::Style {
-        background: Some(Color::TRANSPARENT.into()),
-        text_color: Color::from_rgb(0.9, 0.9, 0.9),
-        border: iced::Border::default(),
-        ..Default::default()
-    };
-    match s {
-        button::Status::Hovered => button::Style {
-            background: Some(Color::from_rgb(0.25, 0.4, 0.6).into()),
-            text_color: Color::WHITE,
-            ..b
+/// Creates a style function for sort/toggle buttons (active or inactive)
+fn make_toggle_btn_style(
+    colors: ThemeColors,
+    is_active: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        if is_active {
+            let base = button::Style {
+                background: Some(colors.bg_selected.into()),
+                text_color: colors.text_primary,
+                border: iced::Border {
+                    color: colors.accent,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            };
+            match s {
+                button::Status::Hovered => button::Style {
+                    background: Some(colors.bg_hover.into()),
+                    ..base
+                },
+                _ => base,
+            }
+        } else {
+            let base = button::Style {
+                background: Some(colors.bg_elevated.into()),
+                text_color: colors.text_secondary,
+                border: iced::Border {
+                    color: colors.border,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            };
+            match s {
+                button::Status::Hovered => button::Style {
+                    background: Some(colors.bg_hover.into()),
+                    text_color: colors.text_primary,
+                    ..base
+                },
+                _ => base,
+            }
+        }
+    }
+}
+
+/// Creates a style function for search input
+fn make_search_input_style(
+    colors: ThemeColors,
+) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |_, _| text_input::Style {
+        background: Background::Color(colors.bg_base),
+        border: iced::Border {
+            color: colors.border,
+            width: 1.0,
+            radius: 3.0.into(),
         },
-        button::Status::Pressed => button::Style {
-            background: Some(Color::from_rgb(0.2, 0.35, 0.5).into()),
-            text_color: Color::WHITE,
-            ..b
-        },
-        _ => b,
+        icon: colors.text_primary,
+        placeholder: colors.text_disabled,
+        value: colors.text_primary,
+        selection: colors.accent,
+    }
+}
+
+/// Creates a style function for clear button
+fn make_clear_btn_style(colors: ThemeColors) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        let base = button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            text_color: colors.text_disabled,
+            border: iced::Border::default(),
+            ..Default::default()
+        };
+        match s {
+            button::Status::Hovered => button::Style {
+                text_color: colors.error,
+                ..base
+            },
+            _ => base,
+        }
+    }
+}
+
+/// Creates a style function for context menu items
+fn make_context_menu_item_style(
+    colors: ThemeColors,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        let base = button::Style {
+            background: Some(Color::TRANSPARENT.into()),
+            text_color: colors.text_primary,
+            border: iced::Border::default(),
+            ..Default::default()
+        };
+        match s {
+            button::Status::Hovered => button::Style {
+                background: Some(colors.accent.into()),
+                text_color: Color::WHITE,
+                ..base
+            },
+            button::Status::Pressed => button::Style {
+                background: Some(colors.accent_pressed.into()),
+                text_color: Color::WHITE,
+                ..base
+            },
+            _ => base,
+        }
+    }
+}
+
+/// Creates a style function for file list items
+fn make_file_item_style(
+    colors: ThemeColors,
+    is_selected: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        let bg = if is_selected {
+            colors.bg_selected
+        } else if s == button::Status::Hovered {
+            colors.bg_hover
+        } else {
+            Color::TRANSPARENT
+        };
+        button::Style {
+            background: Some(bg.into()),
+            text_color: colors.text_primary,
+            ..Default::default()
+        }
+    }
+}
+
+/// Creates a style function for theme toggle button
+fn make_theme_toggle_style(
+    colors: ThemeColors,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, s| {
+        let base = button::Style {
+            background: Some(colors.bg_elevated.into()),
+            text_color: colors.text_primary,
+            border: iced::Border {
+                color: colors.border,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        };
+        match s {
+            button::Status::Hovered => button::Style {
+                background: Some(colors.bg_hover.into()),
+                border: iced::Border {
+                    color: colors.accent,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..base
+            },
+            _ => base,
+        }
     }
 }
