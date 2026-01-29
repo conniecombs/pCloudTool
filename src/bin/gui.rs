@@ -8,7 +8,7 @@ use iced::widget::{
 };
 use iced::{alignment, Alignment, Background, Color, Element, Length, Subscription, Task, Theme};
 
-use pcloud_rust::{FileItem, PCloudClient, Region};
+use pcloud_rust::{AccountInfo, DuplicateMode, FileItem, PCloudClient, Region};
 use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,6 +87,7 @@ struct PCloudGui {
     selected_item: Option<FileItem>,
     concurrency_setting: usize,
     active_concurrency: usize,
+    use_adaptive_concurrency: bool,
     staged_transfer: Option<TransferType>,
     active_transfer: Option<TransferType>,
     bytes_progress: Arc<AtomicU64>,
@@ -98,6 +99,10 @@ struct PCloudGui {
     last_click_time: Option<std::time::Instant>,
     last_clicked_item: Option<String>,
     create_folder_state: CreateFolderState,
+    // Account info for quota display
+    account_info: Option<AccountInfo>,
+    // Duplicate mode setting
+    duplicate_mode: DuplicateMode,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +365,12 @@ enum Message {
     CreateFolderConfirmed,
     CreateFolderResult(Result<(), String>),
     CancelCreateFolder,
+    // Account info
+    FetchAccountInfo,
+    AccountInfoResult(Result<AccountInfo, String>),
+    // Settings
+    ToggleAdaptiveConcurrency(bool),
+    DuplicateModeChanged(DuplicateMode),
 }
 
 /// State for creating a new folder
@@ -371,18 +382,21 @@ struct CreateFolderState {
 
 impl PCloudGui {
     fn new() -> (Self, Task<Message>) {
+        // Use adaptive worker count by default
+        let adaptive_workers = PCloudClient::calculate_adaptive_workers();
         (
             Self {
                 state: AppState::Login,
                 status: Status::Idle,
                 username: String::new(),
                 password: String::new(),
-                client: PCloudClient::new(None, Region::US, 20),
+                client: PCloudClient::new(None, Region::US, adaptive_workers),
                 current_path: "/".to_string(),
                 file_list: Arc::new(Vec::new()),
                 selected_item: None,
-                concurrency_setting: 8,
-                active_concurrency: 8,
+                concurrency_setting: adaptive_workers,
+                active_concurrency: adaptive_workers,
+                use_adaptive_concurrency: true,
                 staged_transfer: None,
                 active_transfer: None,
                 bytes_progress: Arc::new(AtomicU64::new(0)),
@@ -393,6 +407,8 @@ impl PCloudGui {
                 last_click_time: None,
                 last_clicked_item: None,
                 create_folder_state: CreateFolderState::default(),
+                account_info: None,
+                duplicate_mode: DuplicateMode::Rename,
             },
             Task::none(),
         )
@@ -469,8 +485,13 @@ impl PCloudGui {
                 Ok(token) => {
                     self.state = AppState::Dashboard;
                     self.client.set_token(token);
+                    self.client.set_duplicate_mode(self.duplicate_mode);
                     self.status = Status::Success("Logged in".into());
-                    self.update(Message::RefreshList)
+                    // Fetch account info and refresh list in parallel
+                    Task::batch([
+                        self.update(Message::RefreshList),
+                        self.update(Message::FetchAccountInfo),
+                    ])
                 }
                 Err(e) => {
                     self.status = Status::Error(e);
@@ -483,6 +504,7 @@ impl PCloudGui {
                 self.active_transfer = None;
                 self.staged_transfer = None;
                 self.status = Status::Idle;
+                self.account_info = None;
                 Task::none()
             }
             Message::ConcurrencyChanged(val) => {
@@ -1051,6 +1073,40 @@ impl PCloudGui {
                 self.create_folder_state = CreateFolderState::default();
                 Task::none()
             }
+            // Account info handlers
+            Message::FetchAccountInfo => {
+                let client = self.client.clone();
+                Task::perform(
+                    async move { client.get_account_info().await.map_err(|e| e.to_string()) },
+                    Message::AccountInfoResult,
+                )
+            }
+            Message::AccountInfoResult(res) => {
+                match res {
+                    Ok(info) => {
+                        self.account_info = Some(info);
+                    }
+                    Err(e) => {
+                        // Silently log error, don't show to user as it's not critical
+                        eprintln!("Failed to fetch account info: {}", e);
+                    }
+                }
+                Task::none()
+            }
+            // Settings handlers
+            Message::ToggleAdaptiveConcurrency(enabled) => {
+                self.use_adaptive_concurrency = enabled;
+                if enabled {
+                    let adaptive = PCloudClient::calculate_adaptive_workers();
+                    self.concurrency_setting = adaptive;
+                }
+                Task::none()
+            }
+            Message::DuplicateModeChanged(mode) => {
+                self.duplicate_mode = mode;
+                self.client.set_duplicate_mode(mode);
+                Task::none()
+            }
         }
     }
 
@@ -1297,6 +1353,93 @@ impl PCloudGui {
             }
         };
 
+        // Account quota display
+        let quota_display: Element<'_, Message> = if let Some(info) = &self.account_info {
+            let used_gb = info.used_quota as f64 / (1024.0 * 1024.0 * 1024.0);
+            let total_gb = info.quota as f64 / (1024.0 * 1024.0 * 1024.0);
+            let pct = info.usage_percent();
+            let bar_color = if pct > 90.0 {
+                Color::from_rgb(0.9, 0.3, 0.3)
+            } else if pct > 75.0 {
+                Color::from_rgb(0.9, 0.7, 0.3)
+            } else {
+                Color::from_rgb(0.3, 0.7, 0.4)
+            };
+            column![
+                text("Storage")
+                    .size(12)
+                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                Space::with_height(5),
+                progress_bar(0.0..=100.0, pct as f32)
+                    .height(6)
+                    .style(move |_| progress_bar::Style {
+                        background: Background::Color(Color::from_rgb(0.2, 0.2, 0.2)),
+                        bar: Background::Color(bar_color),
+                        border: iced::Border {
+                            radius: 3.0.into(),
+                            ..Default::default()
+                        },
+                    }),
+                Space::with_height(3),
+                text(format!("{:.1} / {:.1} GB ({:.0}%)", used_gb, total_gb, pct))
+                    .size(10)
+                    .color(Color::from_rgb(0.6, 0.6, 0.6)),
+                Space::with_height(15),
+            ]
+            .into()
+        } else {
+            Space::with_height(0).into()
+        };
+
+        // Duplicate mode buttons
+        let dup_mode_btns = row![
+            button(text("Skip").size(10))
+                .padding([4, 8])
+                .style(if self.duplicate_mode == DuplicateMode::Skip {
+                    style_sort_active
+                } else {
+                    style_sort_inactive
+                })
+                .on_press(Message::DuplicateModeChanged(DuplicateMode::Skip)),
+            Space::with_width(4),
+            button(text("Rename").size(10))
+                .padding([4, 8])
+                .style(if self.duplicate_mode == DuplicateMode::Rename {
+                    style_sort_active
+                } else {
+                    style_sort_inactive
+                })
+                .on_press(Message::DuplicateModeChanged(DuplicateMode::Rename)),
+            Space::with_width(4),
+            button(text("Overwrite").size(10))
+                .padding([4, 8])
+                .style(if self.duplicate_mode == DuplicateMode::Overwrite {
+                    style_sort_active
+                } else {
+                    style_sort_inactive
+                })
+                .on_press(Message::DuplicateModeChanged(DuplicateMode::Overwrite)),
+        ];
+
+        // Adaptive concurrency toggle
+        let adaptive_toggle = row![button(
+            text(if self.use_adaptive_concurrency {
+                "Auto"
+            } else {
+                "Manual"
+            })
+            .size(10)
+        )
+        .padding([4, 8])
+        .style(if self.use_adaptive_concurrency {
+            style_sort_active
+        } else {
+            style_sort_inactive
+        })
+        .on_press(Message::ToggleAdaptiveConcurrency(
+            !self.use_adaptive_concurrency
+        )),];
+
         // Keyboard shortcuts help text
         let shortcuts_help = column![
             text("Keyboard Shortcuts")
@@ -1334,8 +1477,9 @@ impl PCloudGui {
         ]
         .spacing(2);
 
-        container(
+        let sidebar_content = scrollable(
             column![
+                quota_display,
                 text("Actions")
                     .size(12)
                     .color(Color::from_rgb(0.5, 0.5, 0.5)),
@@ -1385,17 +1529,34 @@ impl PCloudGui {
                         b
                     }
                 },
-                Space::with_height(30),
-                text(format!("Concurrency: {}", self.concurrency_setting))
+                Space::with_height(20),
+                text("Duplicates")
                     .size(12)
-                    .color(Color::from_rgb(0.7, 0.7, 0.7)),
-                slider(
-                    1.0..=20.0,
-                    self.concurrency_setting as f64,
-                    Message::ConcurrencyChanged
-                )
-                .step(1.0),
-                Space::with_height(30),
+                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+                Space::with_height(5),
+                dup_mode_btns,
+                Space::with_height(20),
+                row![
+                    text(format!("Threads: {}", self.concurrency_setting))
+                        .size(12)
+                        .color(Color::from_rgb(0.7, 0.7, 0.7)),
+                    horizontal_space(),
+                    adaptive_toggle,
+                ]
+                .align_y(Alignment::Center),
+                if !self.use_adaptive_concurrency {
+                    Element::from(
+                        slider(
+                            1.0..=32.0,
+                            self.concurrency_setting as f64,
+                            Message::ConcurrencyChanged,
+                        )
+                        .step(1.0),
+                    )
+                } else {
+                    Element::from(Space::with_height(0))
+                },
+                Space::with_height(20),
                 text("Navigation")
                     .size(12)
                     .color(Color::from_rgb(0.5, 0.5, 0.5)),
@@ -1411,18 +1572,20 @@ impl PCloudGui {
                     .padding(8)
                     .style(style_secondary)
                     .on_press(Message::RefreshList),
-                Space::with_height(30),
+                Space::with_height(20),
                 shortcuts_help,
             ]
             .width(200),
-        )
-        .padding(20)
-        .style(|_| container::Style {
-            background: Some(Color::from_rgb(0.12, 0.12, 0.12).into()),
-            ..Default::default()
-        })
-        .height(Length::Fill)
-        .into()
+        );
+
+        container(sidebar_content)
+            .padding(20)
+            .style(|_| container::Style {
+                background: Some(Color::from_rgb(0.12, 0.12, 0.12).into()),
+                ..Default::default()
+            })
+            .height(Length::Fill)
+            .into()
     }
 
     fn view_file_list(&self) -> Element<'_, Message> {
