@@ -2,6 +2,42 @@
 //!
 //! A high-performance, async Rust client for the pCloud API with support for
 //! parallel file transfers, recursive folder sync, resume capability, and duplicate detection.
+//!
+//! ## Features
+//!
+//! - **Parallel transfers**: Upload/download multiple files concurrently (1-32 workers)
+//! - **Adaptive workers**: Auto-configure optimal worker count based on system resources
+//! - **Resume capability**: Save and restore interrupted transfers with state validation
+//! - **Bidirectional sync**: Sync folders with SHA256 checksum comparison
+//! - **Chunked uploads**: Support for large files (>2GB) using pCloud's chunked API
+//! - **Per-file timeouts**: Size-based timeouts with automatic retry and exponential backoff
+//! - **Streaming I/O**: Memory-efficient transfers (~10 MB constant usage)
+//! - **Zero unsafe code**: Memory-safe by design
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use pcloud_rust::{PCloudClient, Region, DuplicateMode};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Create client with adaptive worker count
+//!     let mut client = PCloudClient::new_adaptive(None, Region::US);
+//!
+//!     // Authenticate
+//!     client.login("user@example.com", "password").await?;
+//!
+//!     // Upload a file
+//!     client.upload_file("local/file.txt", "/remote/folder").await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Error Handling
+//!
+//! All operations return `Result<T, PCloudError>`. The [`PCloudError`] enum provides
+//! detailed error information for API errors, network failures, I/O issues, and more.
 
 use futures::stream::{self, StreamExt};
 use reqwest::{multipart, Client};
