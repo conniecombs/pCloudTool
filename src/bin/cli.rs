@@ -8,7 +8,21 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "pcloud-cli")]
-#[command(author, version, about = "pCloud Fast Transfer CLI - High-performance upload/download tool", long_about = None)]
+#[command(
+    author,
+    version,
+    about = "pCloud Fast Transfer CLI - High-performance upload/download tool"
+)]
+#[command(
+    long_about = "A high-performance CLI tool for uploading and downloading files to/from pCloud.\n\n\
+Features:\n\
+  - Parallel file transfers (1-32 concurrent workers)\n\
+  - Recursive folder upload/download\n\
+  - Bidirectional folder sync with checksums\n\
+  - Resume interrupted transfers\n\
+  - Duplicate handling (skip/overwrite/rename)\n\n\
+For more information, visit: https://github.com/conniecombs/pCloudTool"
+)]
 struct Cli {
     /// Enable verbose logging (can also use RUST_LOG env var)
     #[arg(short, long)]

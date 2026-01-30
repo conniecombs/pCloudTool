@@ -1,15 +1,23 @@
 [package]
 name = "pcloud-rust"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["pCloud Fast Transfer Contributors"]
-description = "High-performance pCloud file transfer tool with parallel uploads/downloads, recursive folder sync, and modern GUI/CLI interfaces"
+description = "High-performance pCloud file transfer tool with parallel uploads/downloads, recursive folder sync, resume capability, and modern GUI/CLI interfaces"
 license = "MIT"
-repository = "https://github.com/conniecombs/NewProject"
-keywords = ["pcloud", "file-transfer", "sync", "upload", "download"]
-categories = ["command-line-utilities", "network-programming"]
+repository = "https://github.com/conniecombs/pCloudTool"
+homepage = "https://github.com/conniecombs/pCloudTool"
+documentation = "https://github.com/conniecombs/pCloudTool#readme"
+keywords = ["pcloud", "file-transfer", "sync", "cloud-storage", "backup"]
+categories = ["command-line-utilities", "network-programming", "filesystem"]
 readme = "README.md"
 rust-version = "1.70"
+exclude = [
+    ".github/*",
+    "tests/*",
+    "*.md",
+    "!README.md",
+]
 
 [[bin]]
 name = "pcloud-gui"

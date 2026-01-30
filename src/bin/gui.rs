@@ -131,10 +131,14 @@ struct ContextMenu {
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 
 pub fn main() -> iced::Result {
-    iced::application("pCloud Fast Transfer", PCloudGui::update, PCloudGui::view)
-        .theme(PCloudGui::theme)
-        .subscription(PCloudGui::subscription)
-        .run_with(PCloudGui::new)
+    iced::application(
+        "pCloud Fast Transfer v1.0",
+        PCloudGui::update,
+        PCloudGui::view,
+    )
+    .theme(PCloudGui::theme)
+    .subscription(PCloudGui::subscription)
+    .run_with(PCloudGui::new)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

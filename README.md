@@ -1,12 +1,14 @@
 # pCloud Fast Transfer
 
+[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/conniecombs/pCloudTool/releases/tag/v1.0.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](#)
+[![CI](https://github.com/conniecombs/pCloudTool/workflows/CI/badge.svg)](https://github.com/conniecombs/pCloudTool/actions)
 
-A high-performance Rust tool for uploading and downloading files to/from pCloud with parallel transfer support, recursive folder sync, and modern GUI and CLI interfaces.
+A high-performance, production-ready Rust tool for uploading and downloading files to/from pCloud with parallel transfer support, recursive folder sync, resume capability, and modern GUI and CLI interfaces.
 
-![pCloud Fast Transfer Banner](https://via.placeholder.com/800x200/1a1a2e/16213e?text=pCloud+Fast+Transfer)
+![pCloud Fast Transfer Banner](https://via.placeholder.com/800x200/1a1a2e/16213e?text=pCloud+Fast+Transfer+v1.0)
 
 ## Features
 
@@ -19,22 +21,18 @@ A high-performance Rust tool for uploading and downloading files to/from pCloud 
 - **Type-safe** with compile-time error checking
 - **Duplicate detection** (skip/overwrite/rename modes)
 
-### New in v0.2.0
+### v1.0.0 Stable Release
 
 | Feature | Description |
 |---------|-------------|
 | ![Sync](https://img.shields.io/badge/-Sync-00b894?style=flat-square) | **Bidirectional folder sync** with SHA256 checksum comparison |
 | ![Resume](https://img.shields.io/badge/-Resume-0984e3?style=flat-square) | **Resume interrupted transfers** - automatically save and restore progress |
 | ![Progress](https://img.shields.io/badge/-Progress-6c5ce7?style=flat-square) | **Per-file progress tracking** - see exactly which file is transferring |
-
-### New in v0.3.0
-
-| Feature | Description |
-|---------|-------------|
 | ![Adaptive](https://img.shields.io/badge/-Adaptive-e17055?style=flat-square) | **Adaptive worker count** - auto-configures based on CPU cores and memory |
 | ![Chunked](https://img.shields.io/badge/-Chunked-00cec9?style=flat-square) | **Chunked uploads** for large files (>2GB) with progress tracking |
 | ![Timeout](https://img.shields.io/badge/-Timeout-fdcb6e?style=flat-square) | **Per-file timeouts** with automatic retry and exponential backoff |
 | ![Validation](https://img.shields.io/badge/-Validation-a29bfe?style=flat-square) | **State file validation** - detect and repair corrupted resume files |
+| ![Theme](https://img.shields.io/badge/-Theme-74b9ff?style=flat-square) | **Light/Dark mode** - Windows Fluent-inspired GUI theming |
 
 ## Quick Start
 
@@ -322,13 +320,14 @@ pcloud-cli resume <state-file.json>
 
 ## Documentation
 
+- **[CHANGELOG.md](CHANGELOG.md)** - Version history and release notes
 - **[RUST_README.md](RUST_README.md)** - Comprehensive documentation
   - Architecture details and improvements
   - Complete API reference
   - Troubleshooting guide
   - Advanced usage examples
-
 - **[SCREENSHOTS.md](SCREENSHOTS.md)** - GUI screenshots and visual guide
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines
 
 ## Development
 
