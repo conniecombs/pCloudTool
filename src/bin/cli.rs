@@ -1,10 +1,53 @@
+//! # pCloud Fast Transfer CLI
+//!
+//! A high-performance command-line interface for pCloud file operations.
+//!
+//! This binary provides commands for uploading, downloading, syncing, and
+//! managing files on pCloud storage with support for parallel transfers,
+//! resumable operations, and bidirectional synchronization.
+//!
+//! ## Usage
+//!
+//! ```bash
+//! # Upload files
+//! pcloud-cli upload file1.txt file2.txt -d /Backups
+//!
+//! # Download a folder recursively
+//! pcloud-cli download my-folder --recursive -d / -o ./downloads
+//!
+//! # Sync folders bidirectionally
+//! pcloud-cli sync ./local-folder -d /remote-folder --direction both
+//!
+//! # Resume an interrupted transfer
+//! pcloud-cli resume .transfer-state.json
+//! ```
+//!
+//! ## Authentication
+//!
+//! Credentials can be provided via:
+//! - Command-line arguments: `--username`, `--password`, `--token`
+//! - Environment variables: `PCLOUD_USERNAME`, `PCLOUD_PASSWORD`, `PCLOUD_TOKEN`
+
 use clap::{Parser, Subcommand};
 use pcloud_rust::{DuplicateMode, PCloudClient, Region, SyncDirection, TransferState};
 use std::path::Path;
-use std::process;
+use std::process::{self, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+
+// =============================================================================
+// Exit Codes
+// =============================================================================
+
+/// Exit code indicating successful completion.
+const EXIT_SUCCESS: u8 = 0;
+/// Exit code indicating a general error occurred.
+const EXIT_ERROR: u8 = 1;
+
+// =============================================================================
+// CLI Definition
+// =============================================================================
 
 #[derive(Parser)]
 #[command(name = "pcloud-cli")]
@@ -197,13 +240,17 @@ fn format_size(size: u64) -> String {
     let mut size = size as f64;
     for unit in ["B", "KB", "MB", "GB", "TB"] {
         if size < 1024.0 {
-            return format!("{:.2} {}", size, unit);
+            return format!("{size:.2} {unit}");
         }
         size /= 1024.0;
     }
-    format!("{:.2} PB", size)
+    format!("{size:.2} PB")
 }
 
+/// Authenticates with pCloud using the provided credentials.
+///
+/// Supports authentication via token or username/password combination.
+/// Credentials can be provided via command-line arguments or environment variables.
 async fn authenticate_client(
     username: Option<String>,
     password: Option<String>,
@@ -213,7 +260,7 @@ async fn authenticate_client(
 ) -> Result<PCloudClient, Box<dyn std::error::Error>> {
     let mut client = PCloudClient::new(token.clone(), region, workers);
 
-    // If we have a token, use it
+    // If we have a token, use it directly
     if let Some(t) = token {
         client.set_token(t);
         return Ok(client);
@@ -221,31 +268,33 @@ async fn authenticate_client(
 
     // Otherwise, authenticate with username/password
     if let (Some(user), Some(pass)) = (username, password) {
-        match client.login(&user, &pass).await {
-            Ok(_token) => {
-                println!("✓ Authenticated successfully");
-                // Note: Token is not printed for security reasons.
-                // Use PCLOUD_TOKEN env var to reuse the token in future sessions.
-                return Ok(client);
-            }
-            Err(e) => {
-                eprintln!("✗ Authentication failed: {}", e);
-                process::exit(1);
-            }
-        }
+        client.login(&user, &pass).await?;
+        println!("✓ Authenticated successfully");
+        return Ok(client);
     }
 
-    eprintln!("✗ Authentication required!");
-    eprintln!("Provide either:");
-    eprintln!("  1. --username and --password");
-    eprintln!("  2. --token");
-    eprintln!("  3. Set PCLOUD_USERNAME and PCLOUD_PASSWORD environment variables");
-    eprintln!("  4. Set PCLOUD_TOKEN environment variable");
-    process::exit(1);
+    Err("Authentication required! Provide:\n  \
+         • --username and --password, or\n  \
+         • --token, or\n  \
+         • Set PCLOUD_USERNAME/PCLOUD_PASSWORD environment variables, or\n  \
+         • Set PCLOUD_TOKEN environment variable"
+        .into())
 }
 
+/// Application entry point.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::from(EXIT_SUCCESS),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+/// Main application logic.
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -253,12 +302,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EnvFilter::new("pcloud_rust=debug,pcloud_cli=debug")
     } else {
         EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("pcloud_rust=info,pcloud_cli=info"))
+            .unwrap_or_else(|_| EnvFilter::new("pcloud_rust=warn,pcloud_cli=info"))
     };
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .without_time()
         .init();
 
     let region = parse_region(&cli.region);
@@ -278,8 +328,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if create_folder {
                 match client.create_folder(&remote_path).await {
-                    Ok(_) => println!("✓ Created folder: {}", remote_path),
-                    Err(e) => eprintln!("Warning: Could not create folder: {}", e),
+                    Ok(_) => println!("✓ Created folder: {remote_path}"),
+                    Err(e) => eprintln!("Warning: Could not create folder: {e}"),
                 }
             }
 
@@ -290,13 +340,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let path = Path::new(file_path);
 
                 if !path.exists() {
-                    eprintln!("✗ Not found: {}", file_path);
+                    eprintln!("✗ Not found: {file_path}");
                     continue;
                 }
 
                 if path.is_dir() {
                     // Upload entire directory tree
-                    println!("📁 Scanning directory: {}", file_path);
+                    println!("📁 Scanning directory: {file_path}");
                     match client
                         .upload_folder_tree(file_path.clone(), remote_path.clone())
                         .await
@@ -306,7 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             upload_tasks.extend(tasks);
                         }
                         Err(e) => {
-                            eprintln!("✗ Error scanning {}: {}", file_path, e);
+                            eprintln!("✗ Error scanning {file_path}: {e}");
                         }
                     }
                 } else {
@@ -323,10 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\n📤 Uploading {} files...\n", upload_tasks.len());
             let (uploaded, failed) = client.upload_files(upload_tasks).await;
 
-            println!(
-                "\n✓ Upload complete: {} uploaded, {} failed",
-                uploaded, failed
-            );
+            println!("\n✓ Upload complete: {uploaded} uploaded, {failed} failed");
 
             if failed > 0 {
                 process::exit(1);
@@ -361,12 +408,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 for folder_name in &files {
                     let full_remote_path = if remote_path == "/" {
-                        format!("/{}", folder_name)
+                        format!("/{folder_name}")
                     } else {
                         format!("{}/{}", remote_path.trim_end_matches('/'), folder_name)
                     };
 
-                    println!("📁 Scanning remote folder: {}", full_remote_path);
+                    println!("📁 Scanning remote folder: {full_remote_path}");
                     match client
                         .download_folder_tree(full_remote_path, local_path.clone())
                         .await
@@ -376,7 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             download_tasks.extend(tasks);
                         }
                         Err(e) => {
-                            eprintln!("✗ Error scanning {}: {}", folder_name, e);
+                            eprintln!("✗ Error scanning {folder_name}: {e}");
                         }
                     }
                 }
@@ -396,7 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("✗ Error listing folder: {}", e);
+                        eprintln!("✗ Error listing folder: {e}");
                         process::exit(1);
                     }
                 }
@@ -404,7 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Download specific files
                 for filename in &files {
                     let full_remote_path = if remote_path == "/" {
-                        format!("/{}", filename)
+                        format!("/{filename}")
                     } else {
                         format!("{}/{}", remote_path.trim_end_matches('/'), filename)
                     };
@@ -420,10 +467,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\n📥 Downloading {} files...\n", download_tasks.len());
             let (downloaded, failed) = client.download_files(download_tasks).await;
 
-            println!(
-                "\n✓ Download complete: {} downloaded, {} failed",
-                downloaded, failed
-            );
+            println!("\n✓ Download complete: {downloaded} downloaded, {failed} failed");
 
             if failed > 0 {
                 process::exit(1);
@@ -438,11 +482,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match client.list_folder(&path).await {
                 Ok(items) => {
                     if items.is_empty() {
-                        println!("Folder '{}' is empty", path);
+                        println!("Folder '{path}' is empty");
                         return Ok(());
                     }
 
-                    println!("\nContents of '{}':\n", path);
+                    println!("\nContents of '{path}':\n");
                     println!("{:<10} {:<40} {:<15}", "Type", "Name", "Size");
                     println!("{}", "-".repeat(70));
 
@@ -460,7 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                 }
                 Err(e) => {
-                    eprintln!("✗ Error listing folder: {}", e);
+                    eprintln!("✗ Error listing folder: {e}");
                     process::exit(1);
                 }
             }
@@ -473,10 +517,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match client.create_folder(&path).await {
                 Ok(_) => {
-                    println!("✓ Created folder: {}", path);
+                    println!("✓ Created folder: {path}");
                 }
                 Err(e) => {
-                    eprintln!("✗ Error creating folder: {}", e);
+                    eprintln!("✗ Error creating folder: {e}");
                     process::exit(1);
                 }
             }
@@ -490,10 +534,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Confirmation prompt unless --yes is specified
             if !yes {
                 let item_type = if folder { "folder" } else { "file" };
-                eprintln!(
-                    "⚠️  Are you sure you want to delete {} '{}'?",
-                    item_type, path
-                );
+                eprintln!("⚠️  Are you sure you want to delete {item_type} '{path}'?");
                 if folder {
                     eprintln!("   This will delete all contents recursively!");
                 }
@@ -516,10 +557,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match result {
                 Ok(_) => {
                     let item_type = if folder { "folder" } else { "file" };
-                    println!("✓ Deleted {}: {}", item_type, path);
+                    println!("✓ Deleted {item_type}: {path}");
                 }
                 Err(e) => {
-                    eprintln!("✗ Error deleting: {}", e);
+                    eprintln!("✗ Error deleting: {e}");
                     process::exit(1);
                 }
             }
@@ -538,10 +579,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match result {
                 Ok(_) => {
-                    println!("✓ Moved: {} -> {}", from, to);
+                    println!("✓ Moved: {from} -> {to}");
                 }
                 Err(e) => {
-                    eprintln!("✗ Error moving: {}", e);
+                    eprintln!("✗ Error moving: {e}");
                     process::exit(1);
                 }
             }
@@ -576,7 +617,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                 }
                 Err(e) => {
-                    eprintln!("✗ Error getting account info: {}", e);
+                    eprintln!("✗ Error getting account info: {e}");
                     process::exit(1);
                 }
             }
@@ -597,7 +638,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Validate local path exists
             if !Path::new(&local_path).exists() {
-                eprintln!("✗ Local path does not exist: {}", local_path);
+                eprintln!("✗ Local path does not exist: {local_path}");
                 process::exit(1);
             }
 
@@ -605,12 +646,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SyncDirection::Upload => "upload only",
                 SyncDirection::Download => "download only",
                 SyncDirection::Bidirectional => "bidirectional",
+                _ => "unknown",
             };
 
             println!("\n🔄 Syncing folders...");
-            println!("   Local:     {}", local_path);
-            println!("   Remote:    {}", remote_path);
-            println!("   Direction: {}", direction_str);
+            println!("   Local:     {local_path}");
+            println!("   Remote:    {remote_path}");
+            println!("   Direction: {direction_str}");
             println!(
                 "   Checksum:  {}",
                 if checksum {
@@ -648,7 +690,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("✗ Sync failed: {}", e);
+                    eprintln!("✗ Sync failed: {e}");
                     process::exit(1);
                 }
             }
@@ -659,7 +701,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut state = match TransferState::load_from_file(&state_file) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("✗ Failed to load transfer state: {}", e);
+                    eprintln!("✗ Failed to load transfer state: {e}");
                     process::exit(1);
                 }
             };
@@ -728,13 +770,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Save updated state
             if let Err(e) = state.save_to_file(&state_file) {
-                eprintln!("Warning: Could not save transfer state: {}", e);
+                eprintln!("Warning: Could not save transfer state: {e}");
             }
 
             println!("\n✓ Resume complete!");
-            println!("  Completed: {} files", completed);
+            println!("  Completed: {completed} files");
             if failed > 0 {
-                println!("  Failed:    {} files", failed);
+                println!("  Failed:    {failed} files");
             }
             println!();
 

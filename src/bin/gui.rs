@@ -1,3 +1,38 @@
+//! # pCloud Fast Transfer GUI
+//!
+//! A modern, cross-platform graphical interface for pCloud file management.
+//!
+//! This application provides an intuitive interface for uploading, downloading,
+//! and managing files on pCloud storage. Built with the Iced GUI framework, it
+//! features a Windows Fluent-inspired design with light and dark themes.
+//!
+//! ## Features
+//!
+//! - **File Browser** — Navigate your pCloud storage with ease
+//! - **Drag & Drop** — Upload files by selecting them in the file dialog
+//! - **Real-time Progress** — Per-file transfer progress with speed metrics
+//! - **Keyboard Shortcuts** — Efficient navigation without leaving the keyboard
+//! - **Theme Support** — Light and dark modes with Windows Fluent design
+//! - **Configurable** — Adjust worker count and duplicate handling
+//!
+//! ## Keyboard Shortcuts
+//!
+//! | Shortcut       | Action              |
+//! |----------------|---------------------|
+//! | Ctrl+U         | Upload files        |
+//! | Ctrl+Shift+U   | Upload folder       |
+//! | Ctrl+D         | Download selected   |
+//! | Ctrl+N         | New folder          |
+//! | Ctrl+R / F5    | Refresh             |
+//! | Enter          | Open folder         |
+//! | Backspace      | Go up               |
+//! | Delete         | Delete selected     |
+//! | Escape         | Cancel / Clear      |
+
+// =============================================================================
+// Imports
+// =============================================================================
+
 use iced::advanced::subscription::{self, Event, Hasher, Recipe};
 use iced::futures::stream::{self, BoxStream, StreamExt};
 use iced::keyboard::{self, Key, Modifiers};
@@ -14,6 +49,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+// =============================================================================
+// Theme System
+// =============================================================================
 
 /// Theme mode for light/dark appearance
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -659,7 +698,7 @@ impl PCloudGui {
             }
             Message::NavigateTo(folder) => {
                 self.current_path = if self.current_path == "/" {
-                    format!("/{}", folder)
+                    format!("/{folder}")
                 } else {
                     format!("{}/{}", self.current_path, folder)
                 };
@@ -855,10 +894,8 @@ impl PCloudGui {
             Message::DeletePressed => {
                 if let Some(item) = &self.selected_item {
                     let item_type = if item.isfolder { "folder" } else { "file" };
-                    self.status = Status::Error(format!(
-                        "Delete {}? Press Delete again to confirm",
-                        item_type
-                    ));
+                    self.status =
+                        Status::Error(format!("Delete {item_type}? Press Delete again to confirm"));
                     Task::none()
                 } else {
                     self.status = Status::Error("Select item to delete".into());
@@ -898,7 +935,7 @@ impl PCloudGui {
                     self.update(Message::RefreshList)
                 }
                 Err(e) => {
-                    self.status = Status::Error(format!("Delete failed: {}", e));
+                    self.status = Status::Error(format!("Delete failed: {e}"));
                     Task::none()
                 }
             },
@@ -1169,7 +1206,7 @@ impl PCloudGui {
                 self.status = Status::Working("Creating folder...".into());
                 let client = self.client.clone();
                 let path = if self.current_path == "/" {
-                    format!("/{}", name)
+                    format!("/{name}")
                 } else {
                     format!("{}/{}", self.current_path, name)
                 };
@@ -1186,7 +1223,7 @@ impl PCloudGui {
                         self.update(Message::RefreshList)
                     }
                     Err(e) => {
-                        self.status = Status::Error(format!("Failed to create folder: {}", e));
+                        self.status = Status::Error(format!("Failed to create folder: {e}"));
                         Task::none()
                     }
                 }
@@ -1210,7 +1247,7 @@ impl PCloudGui {
                     }
                     Err(e) => {
                         // Silently log error, don't show to user as it's not critical
-                        eprintln!("Failed to fetch account info: {}", e);
+                        eprintln!("Failed to fetch account info: {e}");
                     }
                 }
                 Task::none()
@@ -1363,7 +1400,7 @@ impl PCloudGui {
                 item.name.clone()
             };
             menu_items.push(
-                text(format!("{} {}", icon, name))
+                text(format!("{icon} {name}"))
                     .size(12)
                     .color(colors.text_secondary)
                     .into(),
@@ -1533,7 +1570,7 @@ impl PCloudGui {
                         },
                     }),
                 Space::with_height(3),
-                text(format!("{:.1} / {:.1} GB ({:.0}%)", used_gb, total_gb, pct))
+                text(format!("{used_gb:.1} / {total_gb:.1} GB ({pct:.0}%)"))
                     .size(10)
                     .color(colors.text_disabled),
                 Space::with_height(15),
@@ -1887,7 +1924,7 @@ impl PCloudGui {
 
             let mut accumulated_path = String::new();
             for (i, part) in parts.iter().enumerate() {
-                accumulated_path = format!("{}/{}", accumulated_path, part);
+                accumulated_path = format!("{accumulated_path}/{part}");
                 let path_clone = accumulated_path.clone();
                 breadcrumb_row =
                     breadcrumb_row.push(text("/").size(14).color(colors.text_disabled));
@@ -1917,7 +1954,7 @@ impl PCloudGui {
         let sort_btn = |label: &str, sort_by: SortBy, colors: ThemeColors, current: SortBy| {
             let is_active = current == sort_by;
             let display = if is_active {
-                format!("{} {}", label, sort_indicator)
+                format!("{label} {sort_indicator}")
             } else {
                 label.to_string()
             };
@@ -1973,7 +2010,7 @@ impl PCloudGui {
             Status::Working(s) => row![text(s).size(12).color(colors.accent)],
             Status::Success(s) => row![text(s).size(12).color(colors.success)],
             Status::Error(s) => {
-                row![text(format!("Error: {}", s)).size(12).color(colors.error)]
+                row![text(format!("Error: {s}")).size(12).color(colors.error)]
             }
             Status::ReadyToUpload(count, bytes) => row![
                 text(format!(
@@ -2075,7 +2112,7 @@ fn format_bytes(b: u64) -> String {
         return "0 B".to_string();
     }
     if b < 1024 {
-        return format!("{} B", b);
+        return format!("{b} B");
     }
 
     const UNITS: &[&str] = &["KB", "MB", "GB", "TB", "PB", "EB"];
