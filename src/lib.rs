@@ -1,18 +1,27 @@
 //! # pCloud Rust Client
 //!
-//! A high-performance, async Rust client for the pCloud API with support for
-//! parallel file transfers, recursive folder sync, resume capability, and duplicate detection.
+//! A high-performance, production-ready async Rust client for the pCloud API.
+//!
+//! This crate provides a complete solution for interacting with pCloud storage,
+//! featuring parallel file transfers, recursive folder synchronization, resumable
+//! transfers, and comprehensive error handling.
 //!
 //! ## Features
 //!
-//! - **Parallel transfers**: Upload/download multiple files concurrently (1-32 workers)
-//! - **Adaptive workers**: Auto-configure optimal worker count based on system resources
-//! - **Resume capability**: Save and restore interrupted transfers with state validation
-//! - **Bidirectional sync**: Sync folders with SHA256 checksum comparison
-//! - **Chunked uploads**: Support for large files (>2GB) using pCloud's chunked API
-//! - **Per-file timeouts**: Size-based timeouts with automatic retry and exponential backoff
-//! - **Streaming I/O**: Memory-efficient transfers (~10 MB constant usage)
-//! - **Zero unsafe code**: Memory-safe by design
+//! - **Parallel Transfers** — Upload and download multiple files concurrently with
+//!   configurable worker pools (1–32 workers)
+//! - **Adaptive Concurrency** — Automatically determines optimal worker count based
+//!   on available CPU cores and system memory
+//! - **Resumable Transfers** — Persist and restore interrupted transfer sessions with
+//!   integrity validation and automatic repair
+//! - **Bidirectional Sync** — Synchronize local and remote directories with optional
+//!   SHA-256 checksum verification
+//! - **Chunked Uploads** — Handle files larger than 2 GB using pCloud's chunked upload API
+//! - **Per-File Timeouts** — Configurable size-based timeouts with automatic retry
+//!   and exponential backoff
+//! - **Streaming I/O** — Memory-efficient transfers maintaining constant ~10 MB usage
+//!   regardless of file size
+//! - **Zero Unsafe Code** — Entirely safe Rust with compile-time memory guarantees
 //!
 //! ## Quick Start
 //!
@@ -21,14 +30,23 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create client with adaptive worker count
+//!     // Create a client with adaptive worker count
 //!     let mut client = PCloudClient::new_adaptive(None, Region::US);
 //!
-//!     // Authenticate
-//!     client.login("user@example.com", "password").await?;
+//!     // Authenticate with pCloud
+//!     let token = client.login("user@example.com", "password").await?;
+//!     println!("Authenticated successfully");
 //!
-//!     // Upload a file
+//!     // Upload a single file
 //!     client.upload_file("local/file.txt", "/remote/folder").await?;
+//!
+//!     // Upload an entire directory tree
+//!     let tasks = client.upload_folder_tree(
+//!         "local/folder".into(),
+//!         "/remote/backup".into(),
+//!     ).await?;
+//!     let (uploaded, failed) = client.upload_files(tasks).await;
+//!     println!("Uploaded {uploaded} files, {failed} failed");
 //!
 //!     Ok(())
 //! }
@@ -36,132 +54,545 @@
 //!
 //! ## Error Handling
 //!
-//! All operations return `Result<T, PCloudError>`. The [`PCloudError`] enum provides
-//! detailed error information for API errors, network failures, I/O issues, and more.
+//! All operations return [`Result<T, PCloudError>`]. The [`PCloudError`] enum provides
+//! detailed, actionable error information:
+//!
+//! ```rust,no_run
+//! use pcloud_rust::{PCloudClient, PCloudError, Region};
+//!
+//! # async fn example() -> Result<(), PCloudError> {
+//! let client = PCloudClient::new_adaptive(None, Region::US);
+//!
+//! match client.list_folder("/nonexistent").await {
+//!     Ok(files) => println!("Found {} files", files.len()),
+//!     Err(PCloudError::ApiError(msg)) => eprintln!("API error: {msg}"),
+//!     Err(PCloudError::NotAuthenticated) => eprintln!("Please log in first"),
+//!     Err(e) => eprintln!("Unexpected error: {e}"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Configuration
+//!
+//! The client supports extensive configuration through builder-style methods:
+//!
+//! ```rust,no_run
+//! use pcloud_rust::{PCloudClient, Region, DuplicateMode, RetryConfig, FileTimeoutConfig};
+//!
+//! let mut client = PCloudClient::new(None, Region::EU, 16);
+//!
+//! // Configure duplicate file handling
+//! client.set_duplicate_mode(DuplicateMode::Skip);
+//!
+//! // Configure retry behavior
+//! client.set_retry_config(RetryConfig {
+//!     max_retries: 5,
+//!     initial_delay_ms: 1000,
+//!     max_delay_ms: 60_000,
+//!     backoff_multiplier: 2.0,
+//! });
+//!
+//! // Configure per-file timeouts
+//! client.set_file_timeout_config(FileTimeoutConfig {
+//!     base_timeout_secs: 30,
+//!     secs_per_mb: 3,
+//!     max_timeout_secs: 3600,
+//! });
+//! ```
+//!
+//! ## Crate Features
+//!
+//! This crate is designed with sensible defaults and requires no feature flags for
+//! standard usage. All functionality is available out of the box.
+//!
+//! ## Safety
+//!
+//! This crate forbids unsafe code and relies entirely on Rust's type system and
+//! ownership model for memory safety. All network operations use TLS 1.2+.
+
+// =============================================================================
+// Imports
+// =============================================================================
 
 use futures::stream::{self, StreamExt};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use sysinfo::System;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, instrument, warn};
 use walkdir::WalkDir;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Base URL for the pCloud US API endpoint.
 const API_US: &str = "https://api.pcloud.com";
+
+/// Base URL for the pCloud EU API endpoint.
 const API_EU: &str = "https://eapi.pcloud.com";
 
-/// Default chunk size for large file uploads (10 MB)
+/// Default chunk size for large file uploads (10 MiB).
+///
+/// This value balances memory usage with upload efficiency. Larger chunks
+/// reduce HTTP overhead but increase memory consumption and retry cost.
 const DEFAULT_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
-/// Threshold for chunked uploads (2 GB)
+/// File size threshold above which chunked uploads are used (2 GiB).
+///
+/// The pCloud API has limitations on single-request uploads for very large
+/// files. Files exceeding this threshold are automatically uploaded in chunks.
 const LARGE_FILE_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Default per-file timeout in seconds
-const DEFAULT_FILE_TIMEOUT_SECS: u64 = 600; // 10 minutes
+/// Default maximum timeout for file operations in seconds (10 minutes).
+///
+/// This serves as the upper bound for size-based timeout calculations.
+const DEFAULT_FILE_TIMEOUT_SECS: u64 = 600;
 
-/// Minimum workers
+/// Minimum number of concurrent workers allowed.
 const MIN_WORKERS: usize = 1;
 
-/// Maximum workers
+/// Maximum number of concurrent workers allowed.
+///
+/// Higher values increase parallelism but may overwhelm the API or exhaust
+/// system resources. The adaptive worker calculation respects this limit.
 const MAX_WORKERS: usize = 32;
 
-/// The pCloud API region to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// =============================================================================
+// Enums & Types
+// =============================================================================
+
+/// The pCloud API region to connect to.
+///
+/// pCloud operates data centers in both the United States and Europe. Selecting
+/// the region closest to you (or where your account is registered) will provide
+/// the best performance.
+///
+/// # Example
+///
+/// ```rust
+/// use pcloud_rust::Region;
+///
+/// let region = Region::EU;
+/// assert_eq!(region.to_string(), "EU");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum Region {
+    /// United States data center (api.pcloud.com).
+    #[default]
     US,
+    /// European Union data center (eapi.pcloud.com).
     EU,
 }
 
 impl Region {
-    fn endpoint(&self) -> &'static str {
+    /// Returns the API base URL for this region.
+    #[inline]
+    #[must_use]
+    pub const fn endpoint(&self) -> &'static str {
         match self {
-            Region::US => API_US,
-            Region::EU => API_EU,
+            Self::US => API_US,
+            Self::EU => API_EU,
+        }
+    }
+
+    /// Returns a human-readable description of the region.
+    #[inline]
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::US => "United States",
+            Self::EU => "European Union",
+        }
+    }
+}
+
+impl fmt::Display for Region {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::US => write!(f, "US"),
+            Self::EU => write!(f, "EU"),
         }
     }
 }
 
 /// Strategy for handling duplicate files during transfers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// When uploading or downloading files, you may encounter files that already
+/// exist at the destination. This enum controls how such conflicts are resolved.
+///
+/// # Example
+///
+/// ```rust
+/// use pcloud_rust::{PCloudClient, Region, DuplicateMode};
+///
+/// let mut client = PCloudClient::new(None, Region::US, 8);
+///
+/// // Skip files that already exist
+/// client.set_duplicate_mode(DuplicateMode::Skip);
+///
+/// // Or overwrite existing files
+/// client.set_duplicate_mode(DuplicateMode::Overwrite);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DuplicateMode {
+    /// Skip files that already exist at the destination.
+    ///
+    /// This is the safest option and preserves existing data.
     Skip,
+    /// Overwrite existing files with the new version.
+    ///
+    /// Use with caution as this permanently replaces existing files.
     Overwrite,
+    /// Allow pCloud to automatically rename the file to avoid conflicts.
+    ///
+    /// The new file will be given a unique name like `file (1).txt`.
+    #[default]
     Rename,
 }
 
-/// Direction for sync operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl fmt::Display for DuplicateMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Skip => write!(f, "skip"),
+            Self::Overwrite => write!(f, "overwrite"),
+            Self::Rename => write!(f, "rename"),
+        }
+    }
+}
+
+/// Direction for folder synchronization operations.
+///
+/// Controls how files are synchronized between local and remote directories.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use pcloud_rust::{PCloudClient, Region, SyncDirection};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = PCloudClient::new_adaptive(None, Region::US);
+///
+/// // Only upload new/changed local files
+/// let result = client.sync_folder(
+///     "./local",
+///     "/remote",
+///     SyncDirection::Upload,
+///     false,
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum SyncDirection {
-    /// Upload local changes to remote
+    /// Upload local changes to remote storage.
+    ///
+    /// Files that exist locally but not remotely (or are newer locally)
+    /// will be uploaded. Remote-only files are ignored.
     Upload,
-    /// Download remote changes to local
+    /// Download remote changes to local storage.
+    ///
+    /// Files that exist remotely but not locally (or are newer remotely)
+    /// will be downloaded. Local-only files are ignored.
     Download,
-    /// Sync both directions (bidirectional)
+    /// Synchronize in both directions.
+    ///
+    /// Both local and remote directories are brought into sync. This is
+    /// the most comprehensive option but may overwrite changes on either side.
+    #[default]
     Bidirectional,
 }
 
-/// Information about a single file transfer.
-#[derive(Debug, Clone)]
+impl fmt::Display for SyncDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Upload => write!(f, "upload"),
+            Self::Download => write!(f, "download"),
+            Self::Bidirectional => write!(f, "bidirectional"),
+        }
+    }
+}
+
+// =============================================================================
+// Progress Tracking
+// =============================================================================
+
+/// Information about a single file transfer in progress.
+///
+/// This struct is passed to progress callbacks during file transfers,
+/// providing real-time visibility into transfer status.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use pcloud_rust::FileTransferInfo;
+/// use std::sync::Arc;
+///
+/// let callback = Arc::new(|info: FileTransferInfo| {
+///     if info.is_complete {
+///         println!("✓ Completed: {}", info.filename);
+///     } else if info.is_failed {
+///         println!("✗ Failed: {} - {:?}", info.filename, info.error_message);
+///     } else {
+///         let percent = (info.transferred as f64 / info.size as f64) * 100.0;
+///         println!("  {} - {:.1}%", info.filename, percent);
+///     }
+/// });
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTransferInfo {
+    /// The filename (without path) being transferred.
     pub filename: String,
+    /// The full local file path.
     pub local_path: String,
+    /// The full remote file path.
     pub remote_path: String,
+    /// Total size of the file in bytes.
     pub size: u64,
+    /// Number of bytes transferred so far.
     pub transferred: u64,
+    /// Whether the transfer completed successfully.
     pub is_complete: bool,
+    /// Whether the transfer failed.
     pub is_failed: bool,
+    /// Error message if the transfer failed.
     pub error_message: Option<String>,
 }
 
-/// Progress callback for per-file tracking.
+impl FileTransferInfo {
+    /// Returns the transfer progress as a percentage (0.0 to 100.0).
+    #[inline]
+    #[must_use]
+    pub fn progress_percent(&self) -> f64 {
+        if self.size == 0 {
+            if self.is_complete {
+                100.0
+            } else {
+                0.0
+            }
+        } else {
+            (self.transferred as f64 / self.size as f64) * 100.0
+        }
+    }
+
+    /// Returns whether the transfer is currently in progress.
+    #[inline]
+    #[must_use]
+    pub const fn is_in_progress(&self) -> bool {
+        !self.is_complete && !self.is_failed
+    }
+}
+
+/// Type alias for a thread-safe progress callback function.
+///
+/// This callback is invoked during file transfers to report progress.
+/// It receives a [`FileTransferInfo`] struct with current transfer state.
 pub type FileProgressCallback = Arc<dyn Fn(FileTransferInfo) + Send + Sync>;
 
-/// State of a transfer session that can be saved and resumed.
+// =============================================================================
+// Transfer State Management
+// =============================================================================
+
+/// Current version of the transfer state file format.
+const TRANSFER_STATE_VERSION: u32 = 1;
+
+/// Serializable state of a transfer session for resumption.
+///
+/// This struct captures all information needed to resume an interrupted
+/// transfer operation. It can be serialized to JSON and saved to disk.
+///
+/// # Integrity
+///
+/// The state includes a SHA-256 checksum for integrity verification.
+/// When loading a state file, use [`TransferState::load_and_validate`]
+/// to detect and optionally repair corruption.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use pcloud_rust::TransferState;
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create a new transfer state
+/// let files = vec![
+///     ("local/a.txt".to_string(), "/remote/a.txt".to_string()),
+///     ("local/b.txt".to_string(), "/remote/b.txt".to_string()),
+/// ];
+/// let state = TransferState::new("upload", files, 1024 * 1024);
+///
+/// // Save to disk
+/// state.save_to_file("transfer.json")?;
+///
+/// // Later: Load and resume
+/// let (mut state, validation) = TransferState::load_and_validate("transfer.json")?;
+/// if !validation.is_valid {
+///     eprintln!("State file issues: {:?}", validation.issues);
+///     if validation.can_repair {
+///         state.repair();
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferState {
+    /// Unique identifier for this transfer session (UUID v4).
     pub id: String,
-    pub direction: String, // "upload" or "download"
+    /// Transfer direction: `"upload"` or `"download"`.
+    pub direction: String,
+    /// Total number of files in the transfer.
     pub total_files: usize,
+    /// Paths of files that completed successfully.
     pub completed_files: Vec<String>,
+    /// Paths of files that failed to transfer.
     pub failed_files: Vec<String>,
-    pub pending_files: Vec<(String, String)>, // (local, remote) or (remote, local)
+    /// Files remaining to be transferred: `(source, destination)` pairs.
+    pub pending_files: Vec<(String, String)>,
+    /// Total bytes across all files.
     pub total_bytes: u64,
+    /// Bytes successfully transferred so far.
     pub transferred_bytes: u64,
+    /// Unix timestamp when the transfer was created.
     pub created_at: u64,
+    /// Unix timestamp of the last update.
     pub updated_at: u64,
-    /// Version field for forward compatibility
-    #[serde(default = "default_version")]
+    /// State file format version for compatibility checking.
+    #[serde(default = "default_state_version")]
     pub version: u32,
-    /// Checksum for integrity validation
+    /// SHA-256 checksum for integrity validation.
     #[serde(default)]
     pub checksum: Option<String>,
 }
 
-fn default_version() -> u32 {
-    1
+/// Returns the current state file version.
+#[inline]
+const fn default_state_version() -> u32 {
+    TRANSFER_STATE_VERSION
 }
 
-/// Result of state file validation
-#[derive(Debug, Clone)]
+/// Result of validating a transfer state file.
+///
+/// Returned by [`TransferState::validate`] and [`TransferState::load_and_validate`].
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use pcloud_rust::TransferState;
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let (mut state, validation) = TransferState::load_and_validate("transfer.json")?;
+///
+/// if !validation.is_valid {
+///     for issue in &validation.issues {
+///         eprintln!("Warning: {issue}");
+///     }
+///
+///     if validation.can_repair {
+///         let repairs = state.repair();
+///         println!("Applied {} repairs", repairs.len());
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateValidation {
+    /// Whether the state file passed all validation checks.
     pub is_valid: bool,
+    /// List of issues found during validation.
     pub issues: Vec<String>,
+    /// Whether automatic repair is possible.
     pub can_repair: bool,
 }
 
+impl StateValidation {
+    /// Creates a new validation result indicating success.
+    #[inline]
+    #[must_use]
+    pub const fn valid() -> Self {
+        Self {
+            is_valid: true,
+            issues: Vec::new(),
+            can_repair: true,
+        }
+    }
+}
+
+/// Returns the current Unix timestamp in seconds.
+#[inline]
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Formats a byte count as a human-readable string.
+///
+/// # Examples
+///
+/// ```rust
+/// use pcloud_rust::format_bytes;
+///
+/// assert_eq!(format_bytes(0), "0 B");
+/// assert_eq!(format_bytes(1024), "1.0 KB");
+/// assert_eq!(format_bytes(1536), "1.5 KB");
+/// ```
+#[must_use]
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let exp = (bytes as f64).log2() / 10.0;
+    let exp = (exp.floor() as usize).min(UNITS.len() - 1);
+
+    if exp == 0 {
+        format!("{bytes} B")
+    } else {
+        let value = bytes as f64 / (1u64 << (exp * 10)) as f64;
+        format!("{value:.1} {}", UNITS[exp])
+    }
+}
+
 impl TransferState {
+    /// Creates a new transfer state with the given files.
+    ///
+    /// # Arguments
+    ///
+    /// * `direction` - Either `"upload"` or `"download"`
+    /// * `files` - Vector of `(source, destination)` path pairs
+    /// * `total_bytes` - Total size of all files in bytes
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pcloud_rust::TransferState;
+    ///
+    /// let files = vec![
+    ///     ("local/file.txt".into(), "/remote/file.txt".into()),
+    /// ];
+    /// let state = TransferState::new("upload", files, 1024);
+    /// assert!(!state.is_complete());
+    /// ```
+    #[must_use]
     pub fn new(direction: &str, files: Vec<(String, String)>, total_bytes: u64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = current_timestamp();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             direction: direction.to_string(),
@@ -173,37 +604,67 @@ impl TransferState {
             transferred_bytes: 0,
             created_at: now,
             updated_at: now,
-            version: 1,
+            version: TRANSFER_STATE_VERSION,
             checksum: None,
         }
     }
 
+    /// Marks a file as successfully completed.
+    ///
+    /// Moves the file from pending to completed and updates the transferred bytes count.
     pub fn mark_completed(&mut self, file_path: &str, bytes: u64) {
         self.pending_files.retain(|(l, _)| l != file_path);
         if !self.completed_files.contains(&file_path.to_string()) {
             self.completed_files.push(file_path.to_string());
-            self.transferred_bytes += bytes;
+            self.transferred_bytes = self.transferred_bytes.saturating_add(bytes);
         }
-        self.update_timestamp();
+        self.touch();
     }
 
+    /// Marks a file as failed.
+    ///
+    /// Moves the file from pending to failed.
     pub fn mark_failed(&mut self, file_path: &str) {
         self.pending_files.retain(|(l, _)| l != file_path);
         if !self.failed_files.contains(&file_path.to_string()) {
             self.failed_files.push(file_path.to_string());
         }
-        self.update_timestamp();
+        self.touch();
     }
 
-    fn update_timestamp(&mut self) {
-        self.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    /// Updates the `updated_at` timestamp to the current time.
+    #[inline]
+    fn touch(&mut self) {
+        self.updated_at = current_timestamp();
     }
 
+    /// Returns `true` if all files have been processed (completed or failed).
+    #[inline]
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         self.pending_files.is_empty()
+    }
+
+    /// Returns the number of files still pending transfer.
+    #[inline]
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending_files.len()
+    }
+
+    /// Returns the transfer progress as a percentage (0.0 to 100.0).
+    #[inline]
+    #[must_use]
+    pub fn progress_percent(&self) -> f64 {
+        if self.total_bytes == 0 {
+            if self.is_complete() {
+                100.0
+            } else {
+                0.0
+            }
+        } else {
+            (self.transferred_bytes as f64 / self.total_bytes as f64) * 100.0
+        }
     }
 
     /// Compute checksum of the state data (excluding the checksum field itself)
@@ -254,8 +715,7 @@ impl TransferState {
             Err(e) => {
                 // Try to repair by extracting valid portions
                 return Err(PCloudError::ApiError(format!(
-                    "State file is corrupted and cannot be parsed: {}",
-                    e
+                    "State file is corrupted and cannot be parsed: {e}"
                 )));
             }
         };
@@ -291,14 +751,14 @@ impl TransferState {
         let mut seen_completed: HashSet<&String> = HashSet::new();
         for f in &self.completed_files {
             if !seen_completed.insert(f) {
-                issues.push(format!("Duplicate in completed_files: {}", f));
+                issues.push(format!("Duplicate in completed_files: {f}"));
             }
         }
 
         let mut seen_failed: HashSet<&String> = HashSet::new();
         for f in &self.failed_files {
             if !seen_failed.insert(f) {
-                issues.push(format!("Duplicate in failed_files: {}", f));
+                issues.push(format!("Duplicate in failed_files: {f}"));
             }
         }
 
@@ -388,7 +848,7 @@ impl TransferState {
         self.checksum = Some(self.compute_checksum());
         repairs.push("Updated checksum".to_string());
 
-        self.update_timestamp();
+        self.touch();
 
         repairs
     }
@@ -402,47 +862,139 @@ impl TransferState {
             "Clearing failed files for retry - caller must rebuild pending list"
         );
         self.failed_files.clear();
-        self.update_timestamp();
+        self.touch();
     }
 }
 
-/// Result of a sync operation.
-#[derive(Debug, Clone)]
+// =============================================================================
+// Sync Operations
+// =============================================================================
+
+/// Result of a folder synchronization operation.
+///
+/// Contains statistics about what was transferred and lists of affected files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncResult {
+    /// Number of files uploaded to remote.
     pub uploaded: u32,
+    /// Number of files downloaded from remote.
     pub downloaded: u32,
+    /// Number of files skipped (already in sync).
     pub skipped: u32,
+    /// Number of files that failed to transfer.
     pub failed: u32,
+    /// List of local file paths that were uploaded.
     pub files_to_upload: Vec<String>,
+    /// List of remote file paths that were downloaded.
     pub files_to_download: Vec<String>,
 }
 
-/// Information about a file for sync comparison.
-#[derive(Debug, Clone)]
+impl SyncResult {
+    /// Returns the total number of files processed.
+    #[inline]
+    #[must_use]
+    pub const fn total_processed(&self) -> u32 {
+        self.uploaded + self.downloaded + self.skipped + self.failed
+    }
+
+    /// Returns `true` if all transfers succeeded.
+    #[inline]
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        self.failed == 0
+    }
+}
+
+/// Information about a file for synchronization comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncFileInfo {
+    /// The file path (relative or absolute).
     pub path: String,
+    /// File size in bytes.
     pub size: u64,
+    /// Optional SHA-256 checksum for content comparison.
     pub checksum: Option<String>,
+    /// Optional modification timestamp.
     pub modified: Option<String>,
 }
 
+// =============================================================================
+// Error Handling
+// =============================================================================
+
 /// Errors that can occur during pCloud API operations.
+///
+/// This enum provides detailed, actionable error information for all
+/// possible failure modes when interacting with the pCloud API.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use pcloud_rust::{PCloudClient, PCloudError, Region};
+///
+/// # async fn example() {
+/// let client = PCloudClient::new_adaptive(None, Region::US);
+///
+/// match client.list_folder("/test").await {
+///     Ok(files) => println!("Found {} files", files.len()),
+///     Err(PCloudError::NotAuthenticated) => {
+///         eprintln!("Error: Please authenticate first");
+///     }
+///     Err(PCloudError::FileNotFound(path)) => {
+///         eprintln!("Error: Path not found: {path}");
+///     }
+///     Err(e) => eprintln!("Error: {e}"),
+/// }
+/// # }
+/// ```
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PCloudError {
-    #[error("API error: {0}")]
+    /// The pCloud API returned an error response.
+    #[error("pCloud API error: {0}")]
     ApiError(String),
-    #[error("Network error: {0}")]
+
+    /// A network error occurred during the HTTP request.
+    #[error("network error: {0}")]
     NetworkError(#[from] reqwest::Error),
-    #[error("IO error: {0}")]
+
+    /// An I/O error occurred reading or writing files.
+    #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
-    #[error("Not authenticated")]
+
+    /// The operation requires authentication, but no token is set.
+    #[error("not authenticated: please call login() first")]
     NotAuthenticated,
-    #[error("Invalid path: {0}")]
+
+    /// The provided path is invalid or malformed.
+    #[error("invalid path: {0}")]
     InvalidPath(String),
-    #[error("File not found: {0}")]
+
+    /// The requested file or folder does not exist.
+    #[error("file not found: {0}")]
     FileNotFound(String),
+
+    /// The operation timed out.
+    #[error("operation timed out after {0:?}")]
+    Timeout(Duration),
+
+    /// The transfer was interrupted and can be resumed.
+    #[error("transfer interrupted: {0} files remaining")]
+    Interrupted(usize),
 }
 
+impl PCloudError {
+    /// Returns `true` if this error is likely transient and retrying may succeed.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::NetworkError(_) | Self::Timeout(_) | Self::Interrupted(_)
+        ) || matches!(self, Self::ApiError(s) if s.starts_with("HTTP error: 5"))
+    }
+}
+
+/// A specialized [`Result`] type for pCloud operations.
 pub type Result<T> = std::result::Result<T, PCloudError>;
 
 // --- INTERNAL HELPERS ---
@@ -518,25 +1070,56 @@ struct ListFolderResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+/// Information about the authenticated pCloud account.
+///
+/// Retrieved via [`PCloudClient::get_account_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountInfo {
+    /// The email address associated with the account.
     pub email: String,
+    /// Total storage quota in bytes.
     pub quota: u64,
+    /// Storage currently used in bytes.
     pub used_quota: u64,
+    /// Whether the account has a premium subscription.
     pub premium: bool,
 }
 
 impl AccountInfo {
-    pub fn available(&self) -> u64 {
+    /// Returns the available storage space in bytes.
+    #[inline]
+    #[must_use]
+    pub const fn available(&self) -> u64 {
         self.quota.saturating_sub(self.used_quota)
     }
 
+    /// Returns the storage usage as a percentage (0.0 to 100.0).
+    #[inline]
+    #[must_use]
     pub fn usage_percent(&self) -> f64 {
         if self.quota == 0 {
             0.0
         } else {
             (self.used_quota as f64 / self.quota as f64) * 100.0
         }
+    }
+
+    /// Returns `true` if the account is running low on storage (>90% used).
+    #[inline]
+    #[must_use]
+    pub fn is_storage_low(&self) -> bool {
+        self.usage_percent() > 90.0
+    }
+
+    /// Formats the quota as a human-readable string.
+    #[must_use]
+    pub fn format_quota(&self) -> String {
+        format!(
+            "{} / {} ({:.1}% used)",
+            format_bytes(self.used_quota),
+            format_bytes(self.quota),
+            self.usage_percent()
+        )
     }
 }
 
@@ -555,11 +1138,38 @@ struct AccountInfoResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+// =============================================================================
+// Configuration Types
+// =============================================================================
+
+/// Configuration for automatic retry behavior on transient failures.
+///
+/// When network errors or server issues occur, the client can automatically
+/// retry operations with exponential backoff.
+///
+/// # Example
+///
+/// ```rust
+/// use pcloud_rust::RetryConfig;
+///
+/// let config = RetryConfig {
+///     max_retries: 5,
+///     initial_delay_ms: 1000,
+///     max_delay_ms: 60_000,
+///     backoff_multiplier: 2.0,
+/// };
+///
+/// // Retry delays: 1s, 2s, 4s, 8s, 16s (capped at 60s)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RetryConfig {
+    /// Maximum number of retry attempts (0 = no retries).
     pub max_retries: u32,
+    /// Initial delay before the first retry in milliseconds.
     pub initial_delay_ms: u64,
+    /// Maximum delay between retries in milliseconds.
     pub max_delay_ms: u64,
+    /// Multiplier applied to delay after each retry.
     pub backoff_multiplier: f64,
 }
 
@@ -568,20 +1178,77 @@ impl Default for RetryConfig {
         Self {
             max_retries: 3,
             initial_delay_ms: 500,
-            max_delay_ms: 30000,
+            max_delay_ms: 30_000,
             backoff_multiplier: 2.0,
         }
     }
 }
 
-/// Configuration for per-file transfer timeouts
-#[derive(Debug, Clone)]
+impl RetryConfig {
+    /// Creates a configuration with no retries.
+    #[inline]
+    #[must_use]
+    pub const fn no_retries() -> Self {
+        Self {
+            max_retries: 0,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+            backoff_multiplier: 1.0,
+        }
+    }
+
+    /// Creates an aggressive retry configuration suitable for unreliable networks.
+    #[inline]
+    #[must_use]
+    pub const fn aggressive() -> Self {
+        Self {
+            max_retries: 10,
+            initial_delay_ms: 100,
+            max_delay_ms: 60_000,
+            backoff_multiplier: 2.0,
+        }
+    }
+
+    /// Calculates the delay for a given retry attempt.
+    #[must_use]
+    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        if attempt == 0 {
+            return Duration::ZERO;
+        }
+        let delay = self.initial_delay_ms as f64 * self.backoff_multiplier.powi(attempt as i32 - 1);
+        Duration::from_millis((delay as u64).min(self.max_delay_ms))
+    }
+}
+
+/// Configuration for per-file transfer timeouts.
+///
+/// Timeouts are calculated based on file size to accommodate larger files
+/// that naturally take longer to transfer.
+///
+/// # Formula
+///
+/// ```text
+/// timeout = min(base_timeout + (file_size_mb * secs_per_mb), max_timeout)
+/// ```
+///
+/// # Example
+///
+/// ```rust
+/// use pcloud_rust::FileTimeoutConfig;
+///
+/// let config = FileTimeoutConfig::default();
+///
+/// // 100 MB file: 60 + (100 * 2) = 260 seconds
+/// let timeout = config.timeout_for_size(100 * 1024 * 1024);
+/// assert_eq!(timeout.as_secs(), 260);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileTimeoutConfig {
-    /// Base timeout in seconds for file operations
+    /// Base timeout in seconds for any file operation.
     pub base_timeout_secs: u64,
-    /// Additional seconds per MB of file size
+    /// Additional seconds per megabyte of file size.
     pub secs_per_mb: u64,
-    /// Maximum timeout regardless of file size
+    /// Maximum timeout in seconds regardless of file size.
     pub max_timeout_secs: u64,
 }
 
@@ -596,23 +1263,63 @@ impl Default for FileTimeoutConfig {
 }
 
 impl FileTimeoutConfig {
-    /// Calculate timeout for a file based on its size
-    pub fn timeout_for_size(&self, size_bytes: u64) -> std::time::Duration {
+    /// Calculates the appropriate timeout for a file of the given size.
+    #[must_use]
+    pub fn timeout_for_size(&self, size_bytes: u64) -> Duration {
         let size_mb = size_bytes / (1024 * 1024);
-        let timeout_secs = self.base_timeout_secs + (size_mb * self.secs_per_mb);
-        let timeout_secs = timeout_secs.min(self.max_timeout_secs);
-        std::time::Duration::from_secs(timeout_secs)
+        let timeout_secs = self
+            .base_timeout_secs
+            .saturating_add(size_mb.saturating_mul(self.secs_per_mb))
+            .min(self.max_timeout_secs);
+        Duration::from_secs(timeout_secs)
+    }
+
+    /// Creates a configuration optimized for fast networks.
+    #[inline]
+    #[must_use]
+    pub const fn fast_network() -> Self {
+        Self {
+            base_timeout_secs: 30,
+            secs_per_mb: 1,
+            max_timeout_secs: 300,
+        }
+    }
+
+    /// Creates a configuration optimized for slow or unreliable networks.
+    #[inline]
+    #[must_use]
+    pub const fn slow_network() -> Self {
+        Self {
+            base_timeout_secs: 120,
+            secs_per_mb: 5,
+            max_timeout_secs: 3600,
+        }
     }
 }
 
-/// Configuration for chunked uploads
-#[derive(Debug, Clone)]
+/// Configuration for chunked uploads of large files.
+///
+/// Files exceeding the threshold are automatically uploaded in chunks,
+/// which is more reliable for large files and allows progress tracking.
+///
+/// # Example
+///
+/// ```rust
+/// use pcloud_rust::ChunkedUploadConfig;
+///
+/// let config = ChunkedUploadConfig {
+///     threshold_bytes: 500 * 1024 * 1024,  // 500 MB
+///     chunk_size: 5 * 1024 * 1024,          // 5 MB chunks
+///     enabled: true,
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkedUploadConfig {
-    /// Threshold above which to use chunked uploads
+    /// File size threshold in bytes above which chunked uploads are used.
     pub threshold_bytes: u64,
-    /// Size of each chunk
+    /// Size of each chunk in bytes.
     pub chunk_size: u64,
-    /// Whether chunked uploads are enabled
+    /// Whether chunked uploads are enabled.
     pub enabled: bool,
 }
 
@@ -626,28 +1333,122 @@ impl Default for ChunkedUploadConfig {
     }
 }
 
+impl ChunkedUploadConfig {
+    /// Creates a disabled chunked upload configuration.
+    #[inline]
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            threshold_bytes: u64::MAX,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            enabled: false,
+        }
+    }
+
+    /// Returns the number of chunks needed for a file of the given size.
+    #[must_use]
+    pub const fn chunks_for_size(&self, size_bytes: u64) -> u64 {
+        if self.chunk_size == 0 {
+            return 1;
+        }
+        (size_bytes + self.chunk_size - 1) / self.chunk_size
+    }
+}
+
+// =============================================================================
+// Client
+// =============================================================================
+
+/// The main pCloud API client.
+///
+/// `PCloudClient` is the primary interface for interacting with pCloud storage.
+/// It handles authentication, file transfers, folder operations, and synchronization.
+///
+/// # Thread Safety
+///
+/// `PCloudClient` implements `Clone` and can be safely shared across threads.
+/// Each clone shares the underlying HTTP connection pool.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use pcloud_rust::{PCloudClient, Region, DuplicateMode};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     // Create a client with adaptive worker count
+///     let mut client = PCloudClient::new_adaptive(None, Region::US);
+///
+///     // Configure duplicate handling
+///     client.set_duplicate_mode(DuplicateMode::Skip);
+///
+///     // Authenticate
+///     client.login("user@example.com", "password").await?;
+///
+///     // Use the client...
+///     let files = client.list_folder("/").await?;
+///     println!("Root contains {} items", files.len());
+///
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct PCloudClient {
+    /// The underlying HTTP client.
     client: Client,
+    /// The API region to connect to.
     region: Region,
+    /// The authentication token (set after login).
     auth_token: Option<String>,
+    /// Number of concurrent workers for parallel operations.
     pub workers: usize,
+    /// Strategy for handling duplicate files.
     pub duplicate_mode: DuplicateMode,
+    /// Configuration for automatic retries.
     pub retry_config: RetryConfig,
+    /// Configuration for per-file timeouts.
     pub file_timeout_config: FileTimeoutConfig,
+    /// Configuration for chunked uploads.
     pub chunked_upload_config: ChunkedUploadConfig,
 }
 
+impl fmt::Debug for PCloudClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PCloudClient")
+            .field("region", &self.region)
+            .field("authenticated", &self.auth_token.is_some())
+            .field("workers", &self.workers)
+            .field("duplicate_mode", &self.duplicate_mode)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PCloudClient {
+    /// Creates a new pCloud client with the specified configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Optional authentication token from a previous session
+    /// * `region` - The pCloud API region to connect to
+    /// * `workers` - Number of concurrent workers for parallel operations (clamped to 1–32)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pcloud_rust::{PCloudClient, Region};
+    ///
+    /// // Create a client for the EU region with 16 workers
+    /// let client = PCloudClient::new(None, Region::EU, 16);
+    /// ```
+    #[must_use]
     pub fn new(token: Option<String>, region: Region, workers: usize) -> Self {
-        // Validate and clamp workers
         let workers = workers.clamp(MIN_WORKERS, MAX_WORKERS);
 
         let client = Client::builder()
             .pool_max_idle_per_host(workers)
-            .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(300))
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_default();
 
@@ -656,77 +1457,148 @@ impl PCloudClient {
             region,
             auth_token: token,
             workers,
-            duplicate_mode: DuplicateMode::Rename,
+            duplicate_mode: DuplicateMode::default(),
             retry_config: RetryConfig::default(),
             file_timeout_config: FileTimeoutConfig::default(),
             chunked_upload_config: ChunkedUploadConfig::default(),
         }
     }
 
-    /// Create a new client with adaptive worker count based on system resources
+    /// Creates a new client with adaptive worker count based on system resources.
+    ///
+    /// The optimal worker count is calculated based on available CPU cores
+    /// and system memory. This is the recommended constructor for most use cases.
+    ///
+    /// # Algorithm
+    ///
+    /// ```text
+    /// cpu_based    = cpu_cores × 2 (I/O-bound tasks benefit from more workers)
+    /// memory_based = available_memory_gb × 20 (~50 MB per worker)
+    /// workers      = min(cpu_based, memory_based), clamped to 1–32
+    /// ```
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pcloud_rust::{PCloudClient, Region};
+    ///
+    /// let client = PCloudClient::new_adaptive(None, Region::US);
+    /// println!("Using {} workers", client.workers);
+    /// ```
+    #[must_use]
     pub fn new_adaptive(token: Option<String>, region: Region) -> Self {
         let workers = Self::calculate_adaptive_workers();
-        info!(
-            workers = workers,
-            "Created client with adaptive worker count"
-        );
+        debug!(workers, "Created client with adaptive worker count");
         Self::new(token, region, workers)
     }
 
-    /// Calculate optimal worker count based on CPU cores and available memory
+    /// Calculates the optimal worker count for the current system.
+    ///
+    /// This can be called independently to preview the worker count that
+    /// [`new_adaptive`](Self::new_adaptive) would use.
+    ///
+    /// # Returns
+    ///
+    /// The recommended number of workers, between 1 and 32.
+    #[must_use]
     pub fn calculate_adaptive_workers() -> usize {
         let mut sys = System::new();
         sys.refresh_cpu_all();
         sys.refresh_memory();
 
-        let cpu_cores = sys.cpus().len();
+        let cpu_cores = sys.cpus().len().max(1);
         let available_memory_gb = sys.available_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
 
-        // Base workers on CPU cores (2x cores is a good baseline for I/O bound tasks)
-        let cpu_based = cpu_cores * 2;
+        // I/O-bound tasks benefit from 2× CPU cores
+        let cpu_based = cpu_cores.saturating_mul(2);
 
-        // Limit based on available memory (each worker might use ~50MB for buffers)
-        let memory_based = (available_memory_gb * 20.0) as usize; // ~50MB per worker
+        // ~50 MB per worker to stay within memory limits
+        let memory_based = (available_memory_gb * 20.0) as usize;
 
-        // Take the minimum of CPU-based and memory-based, clamped to valid range
         let workers = cpu_based.min(memory_based).clamp(MIN_WORKERS, MAX_WORKERS);
 
-        info!(
-            cpu_cores = cpu_cores,
-            available_memory_gb = format!("{:.2}", available_memory_gb),
-            calculated_workers = workers,
+        debug!(
+            cpu_cores,
+            available_memory_gb = format!("{available_memory_gb:.2}"),
+            workers,
             "Calculated adaptive worker count"
         );
 
         workers
     }
 
+    /// Sets the retry configuration for transient failures.
+    #[inline]
     pub fn set_retry_config(&mut self, config: RetryConfig) {
         self.retry_config = config;
     }
 
+    /// Disables automatic retries for all operations.
+    #[inline]
     pub fn disable_retries(&mut self) {
-        self.retry_config.max_retries = 0;
+        self.retry_config = RetryConfig::no_retries();
     }
 
-    pub fn set_token(&mut self, token: String) {
-        self.auth_token = Some(token);
+    /// Sets the authentication token.
+    ///
+    /// This is typically called automatically by [`login`](Self::login),
+    /// but can be used to restore a token from a previous session.
+    #[inline]
+    pub fn set_token(&mut self, token: impl Into<String>) {
+        self.auth_token = Some(token.into());
     }
 
+    /// Returns the current authentication token, if set.
+    #[inline]
+    #[must_use]
+    pub fn token(&self) -> Option<&str> {
+        self.auth_token.as_deref()
+    }
+
+    /// Returns `true` if the client has an authentication token.
+    #[inline]
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.auth_token.is_some()
+    }
+
+    /// Sets the duplicate file handling strategy.
+    #[inline]
     pub fn set_duplicate_mode(&mut self, mode: DuplicateMode) {
         self.duplicate_mode = mode;
     }
 
+    /// Sets the per-file timeout configuration.
+    #[inline]
     pub fn set_file_timeout_config(&mut self, config: FileTimeoutConfig) {
         self.file_timeout_config = config;
     }
 
+    /// Sets the chunked upload configuration.
+    #[inline]
     pub fn set_chunked_upload_config(&mut self, config: ChunkedUploadConfig) {
         self.chunked_upload_config = config;
     }
 
+    /// Returns the API region this client is configured for.
+    #[inline]
+    #[must_use]
+    pub const fn region(&self) -> Region {
+        self.region
+    }
+
+    /// Constructs the full URL for an API method.
+    #[inline]
     fn api_url(&self, method: &str) -> String {
         format!("{}/{}", self.region.endpoint(), method)
+    }
+
+    /// Returns the authentication token or an error if not authenticated.
+    #[inline]
+    fn require_auth(&self) -> Result<&str> {
+        self.auth_token
+            .as_deref()
+            .ok_or(PCloudError::NotAuthenticated)
     }
 
     fn ensure_success(response: &ApiResponse) -> Result<()> {
@@ -807,6 +1679,40 @@ impl PCloudClient {
         }
     }
 
+    /// Authenticates with pCloud using username and password.
+    ///
+    /// On success, the authentication token is stored in the client and
+    /// returned for optional persistence across sessions.
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - The pCloud account email address
+    /// * `password` - The account password
+    ///
+    /// # Returns
+    ///
+    /// The authentication token on success, which can be saved and passed
+    /// to [`new`](Self::new) or [`set_token`](Self::set_token) later.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authentication fails or a network error occurs.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use pcloud_rust::{PCloudClient, Region};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut client = PCloudClient::new_adaptive(None, Region::US);
+    /// let token = client.login("user@example.com", "password").await?;
+    ///
+    /// // Save token for later use
+    /// std::fs::write(".pcloud_token", &token)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self, password), fields(username = %username))]
     pub async fn login(&mut self, username: &str, password: &str) -> Result<String> {
         let url = self.api_url("userinfo");
         let params = [
@@ -821,20 +1727,45 @@ impl PCloudClient {
 
         let token = api_resp
             .auth
-            .ok_or_else(|| PCloudError::ApiError("No auth token in response".to_string()))?;
+            .ok_or_else(|| PCloudError::ApiError("no auth token in response".into()))?;
+
         self.auth_token = Some(token.clone());
+        info!("Successfully authenticated");
         Ok(token)
     }
 
+    // =========================================================================
+    // Folder Operations
+    // =========================================================================
+
+    /// Creates a folder at the specified path.
+    ///
+    /// If the folder already exists, this operation succeeds silently.
+    /// Parent directories are created automatically if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if not authenticated or the path is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use pcloud_rust::{PCloudClient, Region};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = PCloudClient::new_adaptive(None, Region::US);
+    /// client.create_folder("/Backups/2024/January").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self), fields(path = %path))]
     pub async fn create_folder(&self, path: &str) -> Result<()> {
         let url = self.api_url("createfolderifnotexists");
-        let auth = self
-            .auth_token
-            .as_deref()
-            .ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self.require_auth()?;
         let params = [("auth", auth), ("path", path)];
 
         let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
+
+        // 2004 = folder already exists, which is fine
         if api_resp.result == 0 || api_resp.result == 2004 {
             Ok(())
         } else {
@@ -842,12 +1773,33 @@ impl PCloudClient {
         }
     }
 
+    /// Lists the contents of a folder.
+    ///
+    /// Returns a list of files and subfolders in the specified directory.
+    /// The list is not recursive—only immediate children are returned.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use pcloud_rust::{PCloudClient, Region};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = PCloudClient::new_adaptive(None, Region::US);
+    ///
+    /// let items = client.list_folder("/Documents").await?;
+    /// for item in items {
+    ///     if item.isfolder {
+    ///         println!("📁 {}", item.name);
+    ///     } else {
+    ///         println!("📄 {} ({} bytes)", item.name, item.size);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self), fields(path = %path))]
     pub async fn list_folder(&self, path: &str) -> Result<Vec<FileItem>> {
         let url = self.api_url("listfolder");
-        let auth = self
-            .auth_token
-            .as_deref()
-            .ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self.require_auth()?;
 
         let params = vec![
             ("auth", auth),
@@ -866,61 +1818,113 @@ impl PCloudClient {
         Ok(api_resp.metadata.map(|m| m.contents).unwrap_or_default())
     }
 
+    /// Deletes a file.
+    ///
+    /// # Warning
+    ///
+    /// This operation is irreversible unless the file is in the trash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file doesn't exist or you don't have permission.
+    #[instrument(skip(self), fields(path = %path))]
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         let url = self.api_url("deletefile");
-        let auth = self
-            .auth_token
-            .as_deref()
-            .ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self.require_auth()?;
         let params = [("auth", auth), ("path", path)];
         let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
+    /// Deletes a folder and all its contents recursively.
+    ///
+    /// # Warning
+    ///
+    /// This operation is irreversible and will delete all files and subfolders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the folder doesn't exist or you don't have permission.
+    #[instrument(skip(self), fields(path = %path))]
     pub async fn delete_folder(&self, path: &str) -> Result<()> {
         let url = self.api_url("deletefolderrecursive");
-        let auth = self
-            .auth_token
-            .as_deref()
-            .ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self.require_auth()?;
         let params = [("auth", auth), ("path", path)];
         let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
+    /// Renames or moves a file.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_path` - Current path of the file
+    /// * `to_path` - New path for the file
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use pcloud_rust::{PCloudClient, Region};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = PCloudClient::new_adaptive(None, Region::US);
+    ///
+    /// // Rename a file
+    /// client.rename_file("/old-name.txt", "/new-name.txt").await?;
+    ///
+    /// // Move a file to another folder
+    /// client.rename_file("/file.txt", "/Archive/file.txt").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self), fields(from = %from_path, to = %to_path))]
     pub async fn rename_file(&self, from_path: &str, to_path: &str) -> Result<()> {
         let url = self.api_url("renamefile");
-        let auth = self
-            .auth_token
-            .as_deref()
-            .ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self.require_auth()?;
         let params = [("auth", auth), ("path", from_path), ("topath", to_path)];
         let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
+    /// Renames or moves a folder.
+    ///
+    /// All contents of the folder are moved with it.
+    #[instrument(skip(self), fields(from = %from_path, to = %to_path))]
     pub async fn rename_folder(&self, from_path: &str, to_path: &str) -> Result<()> {
         let url = self.api_url("renamefolder");
-        let auth = self
-            .auth_token
-            .as_deref()
-            .ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self.require_auth()?;
         let params = [("auth", auth), ("path", from_path), ("topath", to_path)];
         let api_resp: ApiResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
         Self::ensure_success(&api_resp)
     }
 
+    /// Retrieves account information including storage quota.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use pcloud_rust::{PCloudClient, Region};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = PCloudClient::new_adaptive(None, Region::US);
+    ///
+    /// let info = client.get_account_info().await?;
+    /// println!("Account: {}", info.email);
+    /// println!("Used: {} / {} bytes", info.used_quota, info.quota);
+    /// println!("Plan: {}", if info.premium { "Premium" } else { "Free" });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self))]
     pub async fn get_account_info(&self) -> Result<AccountInfo> {
         let url = self.api_url("userinfo");
-        let auth = self
-            .auth_token
-            .as_deref()
-            .ok_or(PCloudError::NotAuthenticated)?;
+        let auth = self.require_auth()?;
         let params = [("auth", auth)];
+
         let api_resp: AccountInfoResponse = self.with_retry(|| self.api_get(&url, &params)).await?;
 
         if api_resp.result != 0 {
-            return Err(PCloudError::ApiError(api_resp.error.unwrap_or_default()));
+            return Err(PCloudError::ApiError(
+                api_resp.error.unwrap_or_else(|| "unknown error".into()),
+            ));
         }
 
         Ok(AccountInfo {
@@ -953,7 +1957,7 @@ impl PCloudClient {
         if api_resp.result == 0 {
             if let Some(host) = api_resp.hosts.as_ref().and_then(|h| h.first()) {
                 if let Some(p) = &api_resp.path {
-                    return Ok(format!("https://{}{}", host, p));
+                    return Ok(format!("https://{host}{p}"));
                 }
             }
         }
@@ -1013,12 +2017,12 @@ impl PCloudClient {
                             .await?;
 
                         let full_remote = if remote_path == "/" {
-                            format!("/{}", filename)
+                            format!("/{filename}")
                         } else {
                             format!("{}/{}", remote_path.trim_end_matches('/'), filename)
                         };
                         let temp_remote = if remote_path == "/" {
-                            format!("/{}", temp_filename)
+                            format!("/{temp_filename}")
                         } else {
                             format!("{}/{}", remote_path.trim_end_matches('/'), temp_filename)
                         };
@@ -1096,8 +2100,7 @@ impl PCloudClient {
         match tokio::time::timeout(timeout, self.upload_file(local_path, remote_path)).await {
             Ok(result) => result,
             Err(_) => Err(PCloudError::ApiError(format!(
-                "Upload timed out after {:?} for file: {}",
-                timeout, local_path
+                "Upload timed out after {timeout:?} for file: {local_path}"
             ))),
         }
     }
@@ -1325,8 +2328,7 @@ impl PCloudClient {
         match tokio::time::timeout(timeout, self.download_file(remote_path, local_folder)).await {
             Ok(result) => result,
             Err(_) => Err(PCloudError::ApiError(format!(
-                "Download timed out after {:?} for file: {}",
-                timeout, remote_path
+                "Download timed out after {timeout:?} for file: {remote_path}"
             ))),
         }
     }
@@ -1457,7 +2459,7 @@ impl PCloudClient {
 
             let relative_str = relative_path.to_string_lossy().replace("\\", "/");
             let remote_full_path = if remote_base == "/" {
-                format!("/{}/{}", folder_name, relative_str)
+                format!("/{folder_name}/{relative_str}")
             } else {
                 format!(
                     "{}/{}/{}",
@@ -1504,7 +2506,7 @@ impl PCloudClient {
             folders_by_depth.entry(depth).or_default().push(f);
         }
 
-        let mut depths: Vec<usize> = folders_by_depth.keys().cloned().collect();
+        let mut depths: Vec<usize> = folders_by_depth.keys().copied().collect();
         depths.sort();
 
         for depth in depths {
