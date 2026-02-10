@@ -853,15 +853,32 @@ impl TransferState {
         repairs
     }
 
-    /// Retry failed files by moving them back to pending
-    pub fn retry_failed(&mut self) {
-        // We need the original file pairs, so this only works if we track them
-        // For now, we'll just clear the failed list - the caller should rebuild pending
-        warn!(
-            failed_count = self.failed_files.len(),
-            "Clearing failed files for retry - caller must rebuild pending list"
-        );
-        self.failed_files.clear();
+    /// Retry failed files by moving them back to pending.
+    ///
+    /// Requires `original_tasks` (the full list of `(source, destination)` pairs
+    /// from the original transfer) so that destination paths can be recovered.
+    /// Failed files whose source path is not found in `original_tasks` are left
+    /// in the failed list.
+    pub fn retry_failed(&mut self, original_tasks: &[(String, String)]) {
+        let task_map: HashMap<&str, &str> = original_tasks
+            .iter()
+            .map(|(src, dst)| (src.as_str(), dst.as_str()))
+            .collect();
+
+        let mut still_failed = Vec::new();
+        for failed_path in self.failed_files.drain(..) {
+            if let Some(&dest) = task_map.get(failed_path.as_str()) {
+                self.pending_files
+                    .push((failed_path, dest.to_string()));
+            } else {
+                warn!(
+                    file = %failed_path,
+                    "Cannot retry failed file: destination path unknown"
+                );
+                still_failed.push(failed_path);
+            }
+        }
+        self.failed_files = still_failed;
         self.touch();
     }
 }
@@ -1722,7 +1739,17 @@ impl PCloudClient {
             ("logout", "1"),
         ];
 
-        let api_resp: ApiResponse = self.api_get(&url, &params).await?;
+        // Use POST to avoid leaking credentials in URL/query strings and logs
+        let response = self.client.post(&url).form(&params).send().await?;
+        Self::check_http_status(&response)?;
+        let body = response.text().await?;
+        let api_resp: ApiResponse = serde_json::from_str(&body).map_err(|e| {
+            PCloudError::ApiError(format!(
+                "Failed to parse login response: {} (body: {})",
+                e,
+                &body[..body.len().min(200)]
+            ))
+        })?;
         Self::ensure_success(&api_resp)?;
 
         let token = api_resp
@@ -2952,7 +2979,7 @@ impl PCloudClient {
         let mut to_download: Vec<(String, String)> = Vec::new();
 
         // Get remote files
-        let remote_items = self.list_folder(remote_path).await.unwrap_or_default();
+        let remote_items = self.list_folder(remote_path).await?;
         let remote_files: HashMap<String, &FileItem> = remote_items
             .iter()
             .filter(|i| !i.isfolder)
@@ -3001,7 +3028,11 @@ impl PCloudClient {
                         ))
                         .await
                         .ok();
-                    local_hash != remote_hash
+                    // If either checksum failed to compute, fall back to size comparison
+                    match (local_hash, remote_hash) {
+                        (Some(lh), Some(rh)) => lh != rh,
+                        _ => *local_size != remote_item.size,
+                    }
                 } else {
                     // Compare sizes
                     *local_size != remote_item.size
@@ -3120,7 +3151,10 @@ impl PCloudClient {
             .files_to_download
             .extend(root_result.files_to_download);
 
-        // Find and sync subfolders
+        // Collect all subfolder names from both local and remote
+        let mut subfolder_names: HashSet<String> = HashSet::new();
+
+        // Discover local subfolders
         let local_root_path = Path::new(local_root);
         if local_root_path.is_dir() {
             for entry in std::fs::read_dir(local_root)? {
@@ -3128,35 +3162,56 @@ impl PCloudClient {
                 let path = entry.path();
                 if path.is_dir() {
                     if let Some(folder_name) = path.file_name().and_then(|n| n.to_str()) {
-                        let local_subfolder = path.to_string_lossy().to_string();
-                        let remote_subfolder =
-                            format!("{}/{}", remote_root.trim_end_matches('/'), folder_name);
-
-                        // Create remote folder if needed
-                        let _ = self.create_folder(&remote_subfolder).await;
-
-                        // Recursively sync subfolder
-                        let sub_result = Box::pin(self.sync_folder_recursive(
-                            &local_subfolder,
-                            &remote_subfolder,
-                            direction,
-                            use_checksum,
-                        ))
-                        .await?;
-
-                        total_result.uploaded += sub_result.uploaded;
-                        total_result.downloaded += sub_result.downloaded;
-                        total_result.skipped += sub_result.skipped;
-                        total_result.failed += sub_result.failed;
-                        total_result
-                            .files_to_upload
-                            .extend(sub_result.files_to_upload);
-                        total_result
-                            .files_to_download
-                            .extend(sub_result.files_to_download);
+                        subfolder_names.insert(folder_name.to_string());
                     }
                 }
             }
+        }
+
+        // Discover remote subfolders (needed for download/bidirectional sync)
+        if matches!(direction, SyncDirection::Download | SyncDirection::Bidirectional) {
+            if let Ok(remote_items) = self.list_folder(remote_root).await {
+                for item in remote_items {
+                    if item.isfolder {
+                        subfolder_names.insert(item.name);
+                    }
+                }
+            }
+        }
+
+        // Sync all discovered subfolders
+        for folder_name in &subfolder_names {
+            let local_subfolder = local_root_path.join(folder_name).to_string_lossy().to_string();
+            let remote_subfolder =
+                format!("{}/{}", remote_root.trim_end_matches('/'), folder_name);
+
+            // Create local folder if it only exists remotely
+            if !Path::new(&local_subfolder).exists() {
+                let _ = std::fs::create_dir_all(&local_subfolder);
+            }
+
+            // Create remote folder if needed
+            let _ = self.create_folder(&remote_subfolder).await;
+
+            // Recursively sync subfolder
+            let sub_result = Box::pin(self.sync_folder_recursive(
+                &local_subfolder,
+                &remote_subfolder,
+                direction,
+                use_checksum,
+            ))
+            .await?;
+
+            total_result.uploaded += sub_result.uploaded;
+            total_result.downloaded += sub_result.downloaded;
+            total_result.skipped += sub_result.skipped;
+            total_result.failed += sub_result.failed;
+            total_result
+                .files_to_upload
+                .extend(sub_result.files_to_upload);
+            total_result
+                .files_to_download
+                .extend(sub_result.files_to_download);
         }
 
         Ok(total_result)
