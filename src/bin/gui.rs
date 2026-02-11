@@ -662,8 +662,12 @@ impl PCloudGui {
             Message::LogoutPressed => {
                 self.state = AppState::Login;
                 self.password.clear();
+                self.client = PCloudClient::new(None, Region::US, self.concurrency_setting);
                 self.active_transfer = None;
                 self.staged_transfer = None;
+                self.file_list = Arc::new(Vec::new());
+                self.selected_item = None;
+                self.current_path = "/".to_string();
                 self.status = Status::Idle;
                 self.account_info = None;
                 Task::none()
@@ -1394,8 +1398,9 @@ impl PCloudGui {
         // Show item name if selected
         if let Some(item) = &menu.item {
             let icon = if item.isfolder { "📁" } else { "📄" };
-            let name = if item.name.len() > 25 {
-                format!("{}...", &item.name[..22])
+            let name = if item.name.chars().count() > 25 {
+                let truncated: String = item.name.chars().take(22).collect();
+                format!("{truncated}...")
             } else {
                 item.name.clone()
             };
@@ -2048,8 +2053,9 @@ impl PCloudGui {
                     .current_file
                     .as_ref()
                     .map(|f| {
-                        if f.len() > 25 {
-                            format!("{}...", &f[..22])
+                        if f.chars().count() > 25 {
+                            let truncated: String = f.chars().take(22).collect();
+                            format!("{truncated}...")
                         } else {
                             f.clone()
                         }

@@ -610,9 +610,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
 
                     // Visual progress bar
-                    let bar_width = 40;
-                    let filled = (info.usage_percent() / 100.0 * bar_width as f64) as usize;
-                    let empty = bar_width - filled;
+                    let bar_width: usize = 40;
+                    let filled =
+                        ((info.usage_percent().clamp(0.0, 100.0)) / 100.0 * bar_width as f64) as usize;
+                    let empty = bar_width.saturating_sub(filled);
                     println!("  [{}{}]", "█".repeat(filled), "░".repeat(empty));
                     println!();
                 }
