@@ -36,6 +36,7 @@
 use iced::advanced::subscription::{self, Event, Hasher, Recipe};
 use iced::futures::stream::{self, BoxStream, StreamExt};
 use iced::keyboard::{self, Key, Modifiers};
+use iced::mouse;
 use iced::time::Instant;
 use iced::widget::{
     button, column, container, horizontal_rule, horizontal_space, mouse_area, opaque, progress_bar,
@@ -254,6 +255,9 @@ struct PCloudGui {
     duplicate_mode: DuplicateMode,
     // Theme mode (light/dark)
     theme_mode: ThemeMode,
+    // Resizable panels
+    sidebar_width: f32,
+    is_resizing_sidebar: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +527,10 @@ enum Message {
     ToggleAdaptiveConcurrency(bool),
     DuplicateModeChanged(DuplicateMode),
     ToggleTheme,
+    // Resize panel messages
+    SidebarResizeStart,
+    SidebarResizeMove(f32),
+    SidebarResizeEnd,
 }
 
 /// State for creating a new folder
@@ -562,6 +570,8 @@ impl PCloudGui {
                 account_info: None,
                 duplicate_mode: DuplicateMode::Rename,
                 theme_mode: ThemeMode::Dark,
+                sidebar_width: 240.0,
+                is_resizing_sidebar: false,
             },
             Task::none(),
         )
@@ -616,7 +626,22 @@ impl PCloudGui {
             Subscription::none()
         };
 
-        Subscription::batch([keyboard_sub, transfer_sub])
+        // Mouse tracking subscription for panel resizing
+        let resize_sub = if self.is_resizing_sidebar {
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    Some(Message::SidebarResizeMove(position.x))
+                }
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    Some(Message::SidebarResizeEnd)
+                }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
+        Subscription::batch([keyboard_sub, transfer_sub, resize_sub])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -1277,6 +1302,23 @@ impl PCloudGui {
                 };
                 Task::none()
             }
+            // Resize panel handlers
+            Message::SidebarResizeStart => {
+                self.is_resizing_sidebar = true;
+                Task::none()
+            }
+            Message::SidebarResizeMove(x) => {
+                if self.is_resizing_sidebar {
+                    // Clamp sidebar width between min and max bounds
+                    // Account for sidebar padding (20px each side)
+                    self.sidebar_width = x.clamp(160.0, 500.0);
+                }
+                Task::none()
+            }
+            Message::SidebarResizeEnd => {
+                self.is_resizing_sidebar = false;
+                Task::none()
+            }
         }
     }
 
@@ -1287,12 +1329,31 @@ impl PCloudGui {
         let sidebar = self.view_sidebar();
         let content = self.view_file_list();
         let status = self.view_status_bar();
+        let colors = self.colors();
+
+        // Draggable resize handle between sidebar and content
+        let resize_handle_color = if self.is_resizing_sidebar {
+            colors.accent
+        } else {
+            colors.border
+        };
+        let resize_handle = mouse_area(
+            container(vertical_rule(1))
+                .width(Length::Fixed(6.0))
+                .height(Length::Fill)
+                .center_x(Length::Fixed(6.0))
+                .style(move |_| container::Style {
+                    background: Some(resize_handle_color.into()),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::SidebarResizeStart);
 
         // Base layout
         let base = column![
             self.view_header(),
             horizontal_rule(1),
-            row![sidebar, vertical_rule(1), content].height(Length::Fill),
+            row![sidebar, resize_handle, content].height(Length::Fill),
             horizontal_rule(1),
             status
         ];
@@ -1794,11 +1855,12 @@ impl PCloudGui {
                 Space::with_height(20),
                 shortcuts_help,
             ]
-            .width(200),
+            .width(Length::Fill),
         );
 
         container(sidebar_content)
             .padding(20)
+            .width(Length::Fixed(self.sidebar_width))
             .style(move |_| container::Style {
                 background: Some(colors.bg_surface.into()),
                 ..Default::default()
