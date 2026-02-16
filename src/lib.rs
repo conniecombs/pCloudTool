@@ -688,13 +688,20 @@ impl TransferState {
         hex::encode(hasher.finalize())
     }
 
-    /// Save state to file with checksum for integrity validation
+    /// Save state to file with checksum for integrity validation.
+    ///
+    /// Uses atomic write (write-to-temp-then-rename) to prevent corruption
+    /// if the process is interrupted during the write.
     pub fn save_to_file(&self, path: &str) -> Result<()> {
         let mut state_with_checksum = self.clone();
         state_with_checksum.checksum = Some(self.compute_checksum());
         let json = serde_json::to_string_pretty(&state_with_checksum)
             .map_err(|e| PCloudError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        std::fs::write(path, json)?;
+
+        // Write to a temporary file first, then atomically rename
+        let tmp_path = format!("{path}.tmp");
+        std::fs::write(&tmp_path, json)?;
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 
@@ -868,8 +875,7 @@ impl TransferState {
         let mut still_failed = Vec::new();
         for failed_path in self.failed_files.drain(..) {
             if let Some(&dest) = task_map.get(failed_path.as_str()) {
-                self.pending_files
-                    .push((failed_path, dest.to_string()));
+                self.pending_files.push((failed_path, dest.to_string()));
             } else {
                 warn!(
                     file = %failed_path,
@@ -1675,15 +1681,8 @@ impl PCloudClient {
                 Err(e) => {
                     attempt += 1;
 
-                    // Check if error is retryable (network errors or 5xx HTTP errors)
-                    let is_retryable = match &e {
-                        PCloudError::NetworkError(_) => true,
-                        PCloudError::ApiError(s) => s.starts_with("HTTP error: 5"),
-                        _ => false,
-                    };
-
                     // Return immediately if error is not retryable or max retries exceeded
-                    if !is_retryable || attempt > self.retry_config.max_retries {
+                    if !e.is_retryable() || attempt > self.retry_config.max_retries {
                         return Err(e);
                     }
 
@@ -2126,9 +2125,7 @@ impl PCloudClient {
 
         match tokio::time::timeout(timeout, self.upload_file(local_path, remote_path)).await {
             Ok(result) => result,
-            Err(_) => Err(PCloudError::ApiError(format!(
-                "Upload timed out after {timeout:?} for file: {local_path}"
-            ))),
+            Err(_) => Err(PCloudError::Timeout(timeout)),
         }
     }
 
@@ -2202,11 +2199,12 @@ impl PCloudClient {
 
         while offset < file_size {
             let bytes_to_read = ((file_size - offset) as usize).min(chunk_size as usize);
-            let bytes_read = file.read(&mut buffer[..bytes_to_read]).await?;
-
-            if bytes_read == 0 {
-                break;
-            }
+            // Use read_exact to ensure we get the full chunk (read() may return partial)
+            let bytes_read = match file.read_exact(&mut buffer[..bytes_to_read]).await {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(PCloudError::IoError(e)),
+            };
 
             // Upload this chunk
             let write_url = self.api_url("upload_write");
@@ -2354,9 +2352,7 @@ impl PCloudClient {
 
         match tokio::time::timeout(timeout, self.download_file(remote_path, local_folder)).await {
             Ok(result) => result,
-            Err(_) => Err(PCloudError::ApiError(format!(
-                "Download timed out after {timeout:?} for file: {remote_path}"
-            ))),
+            Err(_) => Err(PCloudError::Timeout(timeout)),
         }
     }
 
@@ -2432,7 +2428,26 @@ impl PCloudClient {
             .split('/')
             .next_back()
             .ok_or_else(|| PCloudError::InvalidPath("Invalid remote path".into()))?;
+
+        // Prevent path traversal attacks via crafted filenames
+        if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+            return Err(PCloudError::InvalidPath(format!(
+                "Filename contains unsafe characters: {filename}"
+            )));
+        }
+
         let local_path = Path::new(local_folder).join(filename);
+
+        // Verify the resolved path is still within the target directory
+        let canonical_folder = std::fs::canonicalize(local_folder)
+            .or_else(|_| Ok::<_, std::io::Error>(Path::new(local_folder).to_path_buf()))?;
+        if let Ok(canonical_file) = local_path.canonicalize() {
+            if !canonical_file.starts_with(&canonical_folder) {
+                return Err(PCloudError::InvalidPath(format!(
+                    "Path traversal detected: {filename}"
+                )));
+            }
+        }
 
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -2441,7 +2456,10 @@ impl PCloudClient {
         let response = self.client.get(&download_url).send().await?;
         Self::check_http_status(&response)?;
 
-        let mut file = tokio::fs::File::create(&local_path).await?;
+        // Write to a temporary file first, then rename on success
+        // This prevents leaving partial/corrupt files on interrupted downloads
+        let tmp_path = local_path.with_extension("part");
+        let mut file = tokio::fs::File::create(&tmp_path).await?;
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
@@ -2449,6 +2467,10 @@ impl PCloudClient {
             file.write_all(&data).await?;
         }
         file.flush().await?;
+        drop(file);
+
+        // Atomically move completed download to final path
+        tokio::fs::rename(&tmp_path, &local_path).await?;
         Ok(local_path.to_string_lossy().to_string())
     }
 
@@ -3169,7 +3191,10 @@ impl PCloudClient {
         }
 
         // Discover remote subfolders (needed for download/bidirectional sync)
-        if matches!(direction, SyncDirection::Download | SyncDirection::Bidirectional) {
+        if matches!(
+            direction,
+            SyncDirection::Download | SyncDirection::Bidirectional
+        ) {
             if let Ok(remote_items) = self.list_folder(remote_root).await {
                 for item in remote_items {
                     if item.isfolder {
@@ -3181,9 +3206,11 @@ impl PCloudClient {
 
         // Sync all discovered subfolders
         for folder_name in &subfolder_names {
-            let local_subfolder = local_root_path.join(folder_name).to_string_lossy().to_string();
-            let remote_subfolder =
-                format!("{}/{}", remote_root.trim_end_matches('/'), folder_name);
+            let local_subfolder = local_root_path
+                .join(folder_name)
+                .to_string_lossy()
+                .to_string();
+            let remote_subfolder = format!("{}/{}", remote_root.trim_end_matches('/'), folder_name);
 
             // Create local folder if it only exists remotely
             if !Path::new(&local_subfolder).exists() {

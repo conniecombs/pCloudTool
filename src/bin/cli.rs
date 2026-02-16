@@ -31,7 +31,7 @@
 use clap::{Parser, Subcommand};
 use pcloud_rust::{DuplicateMode, PCloudClient, Region, SyncDirection, TransferState};
 use std::path::Path;
-use std::process::{self, ExitCode};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -366,8 +366,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if upload_tasks.is_empty() {
-                eprintln!("✗ No files to upload");
-                process::exit(1);
+                return Err("No files to upload".into());
             }
 
             println!("\n📤 Uploading {} files...\n", upload_tasks.len());
@@ -376,7 +375,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("\n✓ Upload complete: {uploaded} uploaded, {failed} failed");
 
             if failed > 0 {
-                process::exit(1);
+                return Err(format!("{failed} file(s) failed to upload").into());
             }
         }
 
@@ -402,8 +401,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if recursive {
                 // Download entire folder tree
                 if files.is_empty() {
-                    eprintln!("✗ Specify folder name to download recursively");
-                    process::exit(1);
+                    return Err("Specify folder name to download recursively".into());
                 }
 
                 for folder_name in &files {
@@ -443,8 +441,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("✗ Error listing folder: {e}");
-                        process::exit(1);
+                        return Err(format!("Error listing folder: {e}").into());
                     }
                 }
             } else {
@@ -460,8 +457,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if download_tasks.is_empty() {
-                eprintln!("✗ No files to download");
-                process::exit(1);
+                return Err("No files to download".into());
             }
 
             println!("\n📥 Downloading {} files...\n", download_tasks.len());
@@ -470,7 +466,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("\n✓ Download complete: {downloaded} downloaded, {failed} failed");
 
             if failed > 0 {
-                process::exit(1);
+                return Err(format!("{failed} file(s) failed to download").into());
             }
         }
 
@@ -504,8 +500,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                 }
                 Err(e) => {
-                    eprintln!("✗ Error listing folder: {e}");
-                    process::exit(1);
+                    return Err(format!("Error listing folder: {e}").into());
                 }
             }
         }
@@ -520,8 +515,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("✓ Created folder: {path}");
                 }
                 Err(e) => {
-                    eprintln!("✗ Error creating folder: {e}");
-                    process::exit(1);
+                    return Err(format!("Error creating folder: {e}").into());
                 }
             }
         }
@@ -543,8 +537,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if input.trim().to_lowercase() != "yes" {
-                    eprintln!("Aborted.");
-                    process::exit(0);
+                    println!("Aborted.");
+                    return Ok(());
                 }
             }
 
@@ -560,8 +554,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("✓ Deleted {item_type}: {path}");
                 }
                 Err(e) => {
-                    eprintln!("✗ Error deleting: {e}");
-                    process::exit(1);
+                    return Err(format!("Error deleting: {e}").into());
                 }
             }
         }
@@ -582,8 +575,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("✓ Moved: {from} -> {to}");
                 }
                 Err(e) => {
-                    eprintln!("✗ Error moving: {e}");
-                    process::exit(1);
+                    return Err(format!("Error moving: {e}").into());
                 }
             }
         }
@@ -611,15 +603,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Visual progress bar
                     let bar_width: usize = 40;
-                    let filled =
-                        ((info.usage_percent().clamp(0.0, 100.0)) / 100.0 * bar_width as f64) as usize;
+                    let filled = ((info.usage_percent().clamp(0.0, 100.0)) / 100.0
+                        * bar_width as f64) as usize;
                     let empty = bar_width.saturating_sub(filled);
                     println!("  [{}{}]", "█".repeat(filled), "░".repeat(empty));
                     println!();
                 }
                 Err(e) => {
-                    eprintln!("✗ Error getting account info: {e}");
-                    process::exit(1);
+                    return Err(format!("Error getting account info: {e}").into());
                 }
             }
         }
@@ -639,15 +630,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             // Validate local path exists
             if !Path::new(&local_path).exists() {
-                eprintln!("✗ Local path does not exist: {local_path}");
-                process::exit(1);
+                return Err(format!("Local path does not exist: {local_path}").into());
             }
 
             let direction_str = match sync_direction {
                 SyncDirection::Upload => "upload only",
                 SyncDirection::Download => "download only",
                 SyncDirection::Bidirectional => "bidirectional",
-                _ => "unknown",
+                _ => "bidirectional",
             };
 
             println!("\n🔄 Syncing folders...");
@@ -687,25 +677,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
 
                     if sync_result.failed > 0 {
-                        process::exit(1);
+                        return Err(
+                            format!("{} file(s) failed during sync", sync_result.failed).into()
+                        );
                     }
                 }
                 Err(e) => {
-                    eprintln!("✗ Sync failed: {e}");
-                    process::exit(1);
+                    return Err(format!("Sync failed: {e}").into());
                 }
             }
         }
 
         Commands::Resume { state_file } => {
             // Load transfer state
-            let mut state = match TransferState::load_from_file(&state_file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("✗ Failed to load transfer state: {e}");
-                    process::exit(1);
-                }
-            };
+            let mut state = TransferState::load_from_file(&state_file).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    format!("Failed to load transfer state: {e}").into()
+                },
+            )?;
 
             println!("\n🔄 Resuming transfer...");
             println!("   Transfer ID: {}", state.id);
@@ -789,7 +778,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if failed > 0 {
-                process::exit(1);
+                return Err(format!("{failed} file(s) failed during resume").into());
             }
         }
     }
